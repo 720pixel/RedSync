@@ -1,0 +1,25 @@
+RedSync bundles and builds on the following open-source projects. Their
+licenses apply to their respective components.
+
+Bundled inside the RedSync binary
+---------------------------------
+dovi_tool        - https://github.com/quietvoid/dovi_tool        (MIT License)
+hdr10plus_tool   - https://github.com/quietvoid/hdr10plus_tool   (MIT License)
+
+Copyright (c) quietvoid. The dovi_tool and hdr10plus_tool executables are
+redistributed unmodified under the terms of the MIT License.
+
+Based on
+--------
+audio-offset-finder - https://github.com/bbc/audio-offset-finder (Apache-2.0)
+
+Copyright (c) BBC. RedSync's offset detection follows the approach of
+audio-offset-finder; no BBC source code is included.
+
+Required at runtime (not bundled)
+---------------------------------
+FFmpeg      - https://ffmpeg.org              (LGPL / GPL)
+MKVToolNix  - https://mkvtoolnix.download     (GPL-2.0)
+MediaInfo   - https://mediaarea.net/MediaInfo (BSD-2-Clause)
+
+These are called as external programs and are not distributed with RedSync.

@@ -1,0 +1,37 @@
+name: release
+
+# Build the Linux and Windows binaries on every tag and attach them to the
+# release. CGO is off so both come out static and cross-compile from one runner.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Build linux + windows
+        run: make release VERSION=${GITHUB_REF_NAME#v}
+
+      - name: Package
+        run: |
+          cd dist
+          tar czf RedSync-${GITHUB_REF_NAME}-linux-x64.tar.gz RedSync
+          zip RedSync-${GITHUB_REF_NAME}-windows-x64.zip RedSync.exe
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/RedSync-*-linux-x64.tar.gz
+            dist/RedSync-*-windows-x64.zip
+          generate_release_notes: true

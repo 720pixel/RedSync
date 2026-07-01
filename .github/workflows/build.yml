@@ -1,0 +1,19 @@
+name: build
+
+# Quick check on pushes and PRs: it compiles and vets clean for both targets.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+      - run: go vet ./...
+      - run: GOOS=linux GOARCH=amd64 go build ./...
+      - run: GOOS=windows GOARCH=amd64 go build ./...

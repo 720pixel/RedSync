@@ -1,0 +1,11 @@
+# built binary
+/RedSync
+/RedSync.exe
+/dist/
+
+# go
+*.test
+*.out
+
+# local scratch
+/work/
