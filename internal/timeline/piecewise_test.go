@@ -51,3 +51,35 @@ func TestPiecewiseRejectsSingleBadAnchor(t *testing.T) {
 		t.Fatalf("bad anchor became a gap: %#v", fit)
 	}
 }
+
+func TestPiecewiseFindsFiveSceneDiscontinuities(t *testing.T) {
+	scale := 25 / (24000.0 / 1001)
+	offsets := []float64{0, 3, 1, 5, 2, 4.5}
+	counts := []int{3, 3, 3, 3, 3, 3}
+	var anchors []Anchor
+	x := 30.0
+	for segment, count := range counts {
+		for i := 0; i < count; i++ {
+			noise := float64((i%3)-1) * .004
+			anchors = append(anchors, Anchor{
+				TargetSeconds: x,
+				DelaySeconds:  (scale-1)*x + offsets[segment] + noise,
+				Score:         10,
+			})
+			x += 60
+		}
+	}
+	fit := Piecewise(anchors, 1120, Options{MinJumpSeconds: .35, MaxSegments: 8})
+	if len(fit.Segments) != 6 || len(fit.Gaps) != 5 {
+		t.Fatalf("segments=%d gaps=%d: %#v", len(fit.Segments), len(fit.Gaps), fit)
+	}
+	wantDelta := []int{3000, -2000, 4000, -3000, 2500}
+	for i, want := range wantDelta {
+		if math.Abs(float64(fit.Gaps[i].DeltaMS-want)) > 20 {
+			t.Fatalf("gap %d = %#v, want delta %dms", i+1, fit.Gaps[i], want)
+		}
+	}
+	if math.Abs(fit.Scale-scale) > .0001 {
+		t.Fatalf("scale %.9f, want %.9f", fit.Scale, scale)
+	}
+}

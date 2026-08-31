@@ -129,6 +129,30 @@ func TestAlignRecoversOffsetAndSpeed(t *testing.T) {
 	}
 }
 
+func TestAlignRecovers25To23976WithShift(t *testing.T) {
+	var reference, target []Cue
+	scale, offset := 25/(24000.0/1001), -2.4
+	for i := 0; i < 90; i++ {
+		start := 7 + float64(i)*8.17 + float64((i*i)%19)*0.19
+		dur := .7 + float64((i*11)%13)*.11
+		reference = append(reference, secondsCue(start, start+dur, i))
+		target = append(target, secondsCue((start-offset)/scale, (start+dur-offset)/scale, i))
+	}
+	a, err := Align(reference, target, AlignOptions{MaxOffsetSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(a.Scale-scale) > 0.00015 {
+		t.Fatalf("scale = %.9f, want %.9f", a.Scale, scale)
+	}
+	if math.Abs(float64(a.OffsetMS)/1000-offset) > 0.03 {
+		t.Fatalf("offset = %dms, want %.0fms", a.OffsetMS, offset*1000)
+	}
+	if a.Score < 0.98 {
+		t.Fatalf("score = %.4f, want >= .98", a.Score)
+	}
+}
+
 func TestApplyClampsAndDropsNegativeCues(t *testing.T) {
 	cues := []Cue{
 		{Start: time.Second, End: 2 * time.Second, Text: []string{"drop"}},

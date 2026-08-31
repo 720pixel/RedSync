@@ -91,7 +91,10 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	initialWin := math.Min(maxOffset+35, sharedDuration*0.22)
 	initialWin = clamp(initialWin, 35, 155)
 	initialWin = math.Min(initialWin, sharedDuration)
-	initial, initialScore, err := offsetAtPositions(ctx, ref.Path, refTrack, 0, target.Path, targetTrack, 0, initialWin)
+	initial, initialScore, initialScale, err := initialAudioMatch(
+		ctx, ref.Path, refTrack, target.Path, targetTrack,
+		initialWin, minScore, ref.Duration, target.Duration,
+	)
 	if err != nil {
 		return Drift{}, fmt.Errorf("initial audio match: %w", err)
 	}
@@ -104,12 +107,17 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 		return Drift{}, fmt.Errorf("measured offset %.3fs exceeds the %.0fs safety limit (raise --max-offset if expected)", initialSec, maxOffset)
 	}
 
-	candidates := speedCandidates(ref.Duration, target.Duration, initialSec, initialCenter)
+	// An ordinary unscaled match describes the delay around the middle of its
+	// window. A scale-aware fallback instead returns the intercept for that
+	// candidate clock. Convert either form to the same centre delay before
+	// deriving the duration candidate.
+	initialCenterDelay := initialSec + (initialScale-1)*initialCenter
+	candidates := speedCandidates(ref.Duration, target.Duration, initialCenterDelay, initialCenter)
 	candidateWin := math.Min(32, math.Max(5, sharedDuration*0.18))
 	bestScale := 1.0
 	bestQuality := math.Inf(-1)
 	for _, scale := range candidates {
-		interceptGuess := initialSec - (scale-1)*initialCenter
+		interceptGuess := initialSec + (initialScale-scale)*initialCenter
 		var scores, corrections []float64
 		for _, frac := range []float64{0.22, 0.50, 0.78} {
 			x := target.Duration * frac
@@ -136,7 +144,7 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 		}
 	}
 
-	bestInterceptGuess := initialSec - (bestScale-1)*initialCenter
+	bestInterceptGuess := initialSec + (initialScale-bestScale)*initialCenter
 	var anchors []audioAnchor
 	probeWin := math.Min(38, math.Max(6, sharedDuration*0.12))
 	probeCount := int(math.Ceil(sharedDuration/75)) + 1
@@ -197,6 +205,33 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	return d, nil
 }
 
+// initialAudioMatch keeps the cheap same-speed path fast, but if its confidence
+// is below the acceptance gate it retries the head against the known film/TV
+// clock ratios and the duration-derived ratio. Without this fallback, the
+// unscaled correlation of a long 25 fps source against a 23.976 reference can
+// smear by several seconds and reject a valid pair before speed detection even
+// starts.
+func initialAudioMatch(ctx context.Context, refPath string, refTrack int, targetPath string, targetTrack int, win, minScore, refDuration, targetDuration float64) (int, float64, float64, error) {
+	delay, score, err := offsetAtPositionsScaled(ctx, refPath, refTrack, 0, targetPath, targetTrack, 0, win, 1)
+	if err != nil || score >= minScore {
+		return delay, score, 1, err
+	}
+	bestDelay, bestScore, bestScale := delay, score, 1.0
+	center := win / 2
+	for _, scale := range speedCandidates(refDuration, targetDuration, float64(delay)/1000, center) {
+		if math.Abs(scale-1) < 0.0000005 {
+			continue
+		}
+		candidateDelay, candidateScore, candidateErr := offsetAtPositionsScaled(
+			ctx, refPath, refTrack, 0, targetPath, targetTrack, 0, win, scale,
+		)
+		if candidateErr == nil && candidateScore > bestScore {
+			bestDelay, bestScore, bestScale = candidateDelay, candidateScore, scale
+		}
+	}
+	return bestDelay, bestScore, bestScale, nil
+}
+
 func refineAudioBoundary(ctx context.Context, ref, target media.File, refTrack, targetTrack int, fit *timeline.Fit, gapIndex int, minScore float64) {
 	if gapIndex < 0 || gapIndex >= len(fit.Gaps) || gapIndex+1 >= len(fit.Segments) {
 		return
@@ -205,11 +240,16 @@ func refineAudioBoundary(ctx context.Context, ref, target media.File, refTrack, 
 	at := float64(fit.Gaps[gapIndex].TargetAtMS) / 1000
 	// The statistical split lies between the nearest dense anchors and can be
 	// half an anchor interval away from the real edit. Search a wide bracket;
-	// the short side-specific probes below keep this accurate without decoding
-	// that whole range.
-	span := math.Min(120, math.Max(45, float64(fit.Gaps[gapIndex].DurationMS)/1000*4))
+	// short side-specific probes refine ordinary edits, and a later silence scan
+	// pins a black gap to its physical boundary.
+	// Episode-length inputs normally have anchors roughly a minute apart. With
+	// several edits, a statistical split can therefore sit well over 45 seconds
+	// from the physical black frame. Keep enough room for a full anchor interval
+	// on either side; the silence/confidence checks still decide the boundary.
+	span := math.Min(180, math.Max(120, float64(fit.Gaps[gapIndex].DurationMS)/1000*6))
 	lo := math.Max(float64(before.TargetStartMS)/1000, at-span)
 	hi := math.Min(float64(after.TargetEndMS)/1000, at+span)
+	bracketLo, bracketHi := lo, hi
 	win := clamp(float64(fit.Gaps[gapIndex].DurationMS)/8000, 0.75, 2)
 	if hi-lo < win*2 {
 		return
@@ -236,13 +276,22 @@ func refineAudioBoundary(ctx context.Context, ref, target media.File, refTrack, 
 	boundary := hi - win/2
 	gapSeconds := float64(fit.Gaps[gapIndex].DurationMS) / 1000
 	if fit.Gaps[gapIndex].DeltaMS < 0 {
-		if silenceAt, ok := findSilenceStart(ctx, target.Path, targetTrack, boundary, math.Max(8, gapSeconds*2), gapSeconds*.60); ok {
+		// Dense anchors locate the offset plateau, not necessarily the exact edit.
+		// Search the full refinement bracket for the digital silence of a black
+		// gap; limiting this to a few seconds around the statistical midpoint can
+		// miss the real boundary when several edits share a programme.
+		searchCenter := (bracketLo + bracketHi) / 2
+		searchRadius := (bracketHi-bracketLo)/2 + win
+		if silenceAt, ok := findSilenceStart(ctx, target.Path, targetTrack, searchCenter, searchRadius, gapSeconds*.60); ok {
 			boundary = silenceAt
 		}
 	} else {
 		before := fit.Segments[gapIndex]
-		refNear := before.Scale*boundary + float64(before.OffsetMS)/1000
-		if silenceAt, ok := findSilenceStart(ctx, ref.Path, refTrack, refNear, math.Max(8, gapSeconds*2), gapSeconds*.60); ok {
+		refLo := before.Scale*bracketLo + float64(before.OffsetMS)/1000
+		refHi := before.Scale*bracketHi + float64(before.OffsetMS)/1000
+		searchCenter := (refLo + refHi) / 2
+		searchRadius := math.Abs(refHi-refLo)/2 + win*before.Scale
+		if silenceAt, ok := findSilenceStart(ctx, ref.Path, refTrack, searchCenter, searchRadius, gapSeconds*.60); ok {
 			boundary = (silenceAt - float64(before.OffsetMS)/1000) / before.Scale
 		}
 	}
@@ -347,12 +396,6 @@ func audioWindowActive(samples []float64) bool {
 		energy += sample * sample
 	}
 	return math.Sqrt(energy/float64(len(samples))) >= 1e-6
-}
-
-// offsetAtPositions compares windows starting at independent timestamps and
-// returns the absolute timestamp adjustment for target.
-func offsetAtPositions(ctx context.Context, refPath string, refIdx int, refAt float64, targetPath string, targetIdx int, targetAt, win float64) (int, float64, error) {
-	return offsetAtPositionsScaled(ctx, refPath, refIdx, refAt, targetPath, targetIdx, targetAt, win, 1)
 }
 
 func offsetAtPositionsScaled(ctx context.Context, refPath string, refIdx int, refAt float64, targetPath string, targetIdx int, targetAt, win, scale float64) (int, float64, error) {

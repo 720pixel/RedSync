@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/720pixel/RedSync/internal/media"
+	"github.com/720pixel/RedSync/internal/offset"
 	"github.com/720pixel/RedSync/internal/timeline"
 )
 
@@ -49,6 +50,75 @@ func TestFindSilenceStart(t *testing.T) {
 	got, ok := findSilenceStart(context.Background(), "fixture", 0, 8, 8, 2)
 	if !ok || math.Abs(got-6) > .06 {
 		t.Fatalf("findSilenceStart = %.3f, %v; want 6.0, true", got, ok)
+	}
+}
+
+func TestInitialAudioMatchRetriesKnownFPSScale(t *testing.T) {
+	originalDecode, originalFind := offsetDecode, offsetFindScaled
+	defer func() {
+		offsetDecode, offsetFindScaled = originalDecode, originalFind
+	}()
+	offsetDecode = func(_ context.Context, _ string, _ int, _, _ float64) ([]float64, error) {
+		return make([]float64, 512), nil
+	}
+	wantScale := 25 / (24000.0 / 1001)
+	offsetFindScaled = func(_, _ []float64, scale float64) (offset.Result, error) {
+		score := 3.7
+		if math.Abs(scale-wantScale) < 0.000001 {
+			score = 11
+		}
+		return offset.Result{Offset: -2.625, Score: score}, nil
+	}
+
+	delay, score, scale, err := initialAudioMatch(
+		context.Background(), "ref", 0, "target", 0,
+		155, 4, 1209.5, 1155.7,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delay != -2625 || score != 11 || math.Abs(scale-wantScale) > 0.000001 {
+		t.Fatalf("initialAudioMatch = %dms, %.2f, %.9f; want -2625ms, 11, %.9f", delay, score, scale, wantScale)
+	}
+}
+
+func TestRefineAudioBoundarySearchesOriginalBracket(t *testing.T) {
+	originalDecode, originalFind := offsetDecode, offsetFindScaled
+	defer func() {
+		offsetDecode, offsetFindScaled = originalDecode, originalFind
+	}()
+	offsetDecode = func(_ context.Context, path string, _ int, start, duration float64) ([]float64, error) {
+		const samplesPerSecond = 100
+		out := make([]float64, int(math.Round(duration*samplesPerSecond)))
+		for i := range out {
+			at := start + float64(i)/samplesPerSecond
+			if path != "target" || at < 345 || at >= 347 {
+				out[i] = .25
+			}
+		}
+		return out, nil
+	}
+	// Equal scores make the classifier keep choosing the old map, deliberately
+	// collapsing its binary-search interval far away from the physical gap.
+	offsetFindScaled = func(_, _ []float64, _ float64) (offset.Result, error) {
+		return offset.Result{Score: 20}, nil
+	}
+	fit := timeline.Fit{
+		Scale: 1,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 300_000, OffsetMS: 0, Scale: 1},
+			{TargetStartMS: 302_000, TargetEndMS: 600_000, OffsetMS: -2_000, Scale: 1},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 300_000, DeltaMS: -2_000, DurationMS: 2_000, Action: "remove_target"}},
+	}
+	ref := media.File{Path: "reference", Duration: 600}
+	target := media.File{Path: "target", Duration: 600}
+	refineAudioBoundary(context.Background(), ref, target, 0, 0, &fit, 0, 7)
+	if math.Abs(float64(fit.Gaps[0].TargetAtMS-345_000)) > 60 {
+		t.Fatalf("gap boundary = %dms, want 345000ms", fit.Gaps[0].TargetAtMS)
+	}
+	if math.Abs(float64(fit.Segments[1].TargetStartMS-347_000)) > 60 {
+		t.Fatalf("resume boundary = %dms, want 347000ms", fit.Segments[1].TargetStartMS)
 	}
 }
 

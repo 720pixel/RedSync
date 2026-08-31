@@ -26,6 +26,10 @@ All notable changes to RedSync are documented here. The format follows
 
 - Corrected the direction of the exact video FPS timestamp ratio and inferred
   audio drift factor.
+- Retry low-confidence head matches at known film/TV clock ratios, so a valid
+  25 fps dub is not rejected before 23.976 fps conversion is evaluated.
+- Refine multi-edit black-gap boundaries across the original anchor bracket,
+  avoiding misplaced cuts when several discontinuities occur in one episode.
 
 ## [0.1.0] - 2026-07-02
 
