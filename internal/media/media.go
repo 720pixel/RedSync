@@ -24,7 +24,7 @@ const (
 // Track is one stream inside a file, normalised to the bits we actually care
 // about for muxing and naming.
 type Track struct {
-	Index    int    // ffmpeg stream index within the file
+	Index    int // ffmpeg stream index within the file
 	Kind     Kind
 	Codec    string // raw codec_name, e.g. eac3, hevc, subrip
 	Language string // iso code, "und" if unknown
@@ -35,8 +35,9 @@ type Track struct {
 	VisImp   bool // visual impaired / descriptive
 	Channels int  // audio only
 	Layout   string
-	Atmos    bool // JOC present
-	Width    int  // video only
+	BitRate  int64 // audio only, 0 when the container does not report it
+	Atmos    bool  // JOC present
+	Width    int   // video only
 	Height   int
 
 	// fps as a rational so we never lose 24000/1001 to float rounding
@@ -48,12 +49,12 @@ type Track struct {
 
 // HDRInfo is what kind of high-dynamic-range a video stream carries.
 type HDRInfo struct {
-	DV       bool
+	DV        bool
 	DVProfile int
-	HDR10    bool
+	HDR10     bool
 	HDR10Plus bool
-	HLG      bool
-	PQ       bool
+	HLG       bool
+	PQ        bool
 }
 
 // File is a probed source with its tracks split out by kind.
@@ -102,6 +103,7 @@ type probeStream struct {
 	Height        int               `json:"height"`
 	Channels      int               `json:"channels"`
 	ChannelLayout string            `json:"channel_layout"`
+	BitRate       string            `json:"bit_rate"`
 	RFrameRate    string            `json:"r_frame_rate"`
 	AvgFrameRate  string            `json:"avg_frame_rate"`
 	ColorTransfer string            `json:"color_transfer"`
@@ -182,6 +184,9 @@ func normalise(s probeStream) Track {
 		Height:   s.Height,
 		Channels: s.Channels,
 		Layout:   s.ChannelLayout,
+	}
+	if br, err := strconv.ParseInt(s.BitRate, 10, 64); err == nil {
+		t.BitRate = br
 	}
 	switch s.CodecType {
 	case "video":

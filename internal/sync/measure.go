@@ -7,15 +7,21 @@ import (
 
 	"github.com/720pixel/RedSync/internal/media"
 	"github.com/720pixel/RedSync/internal/offset"
+	"github.com/720pixel/RedSync/internal/timeline"
 )
 
 // Drift is what we learn from comparing an external source against the video.
 type Drift struct {
-	DelayMS   int     // constant delay for mkvmerge --sync
-	Linear    string  // o/p factor for mkvmerge, "" when no fps stretch needed
-	FPSStretch bool   // true if we corrected a frame-rate mismatch
-	Score     float64 // confidence of the audio match
-	Probe1, Probe2 int // measured delay at the two probe points (ms), for the log
+	DelayMS        int                // constant delay for mkvmerge --sync
+	Linear         string             // o/p factor for mkvmerge, "" when no fps stretch needed
+	Scale          float64            // numeric form of Linear; 1 for no stretch
+	FPSStretch     bool               // true if we corrected a frame-rate mismatch
+	Score          float64            // confidence of the audio match
+	Samples        int                // number of reliable timeline anchors
+	ResidualMS     int                // median residual after the affine fit
+	Probe1, Probe2 int                // measured delay at the first and last probe points
+	Segments       []timeline.Segment // continuous target-to-reference maps
+	Gaps           []timeline.Gap     // internal edits between those maps
 }
 
 // probe windows. we sample two spots so we can tell a constant delay apart from
@@ -70,11 +76,13 @@ func Measure(ctx context.Context, ref, ext media.File, refDur float64) (Drift, e
 		return Drift{}, err
 	}
 	dr := Drift{DelayMS: d1, Score: s1, Probe1: d1, Probe2: d1}
+	dr.Samples = 1
 
 	if late > 0 {
 		d2, s2, err := offsetAt(ctx, ref.Path, refIdx, ext.Path, extIdx, late, win)
 		if err == nil && s2 > 4 {
 			dr.Probe2 = d2
+			dr.Samples = 2
 			// disagreement between the two probes => the clocks are drifting
 			if math.Abs(float64(d2-d1)) > 40 {
 				dr.FPSStretch = true
@@ -86,8 +94,16 @@ func Measure(ctx context.Context, ref, ext media.File, refDur float64) (Drift, e
 	// if we know both frame rates and they differ, that exact ratio beats any
 	// inference - use it and don't guess.
 	if rf, ef := ref.FPS(), ext.FPS(); rf > 0 && ef > 0 && math.Abs(rf-ef) > 0.01 {
+		scale := ef / rf // target timestamps -> reference timestamps
+		slope := scale - 1
+		intercepts := []float64{float64(d1) - slope*early*1000}
+		if dr.Samples > 1 {
+			intercepts = append(intercepts, float64(dr.Probe2)-slope*late*1000)
+		}
+		dr.DelayMS = int(math.Round(median(intercepts)))
 		dr.FPSStretch = true
 		dr.Linear = exactFPSRatio(ref.Video[0], ext.Video[0])
+		dr.Scale = scale
 	}
 	return dr, nil
 }
@@ -116,11 +132,11 @@ func offsetAt(ctx context.Context, refPath string, refIdx int, extPath string, e
 }
 
 // exactFPSRatio builds the mkvmerge o/p factor from the two video fps as a clean
-// rational: (refNum*extDen)/(refDen*extNum). Multiplying ext timestamps by this
+// rational: extFPS/refFPS. Multiplying ext timestamps by this
 // slews it onto the video's clock.
 func exactFPSRatio(refV, extV media.Track) string {
-	o := refV.FPSNum * extV.FPSDen
-	p := refV.FPSDen * extV.FPSNum
+	o := extV.FPSNum * refV.FPSDen
+	p := extV.FPSDen * refV.FPSNum
 	if g := gcd(o, p); g > 1 {
 		o /= g
 		p /= g
@@ -135,7 +151,8 @@ func fpsLinear(ref, ext media.File, d1, d2 int, t1, t2 float64, dr *Drift) strin
 		return exactFPSRatio(ref.Video[0], ext.Video[0])
 	}
 	slope := float64(d2-d1) / ((t2 - t1) * 1000) // ms per ms
-	op := 1.0 - slope
+	op := 1.0 + slope
+	dr.Scale = op
 	// keep the constant term anchored at t=0
 	dr.DelayMS = d1 - int(math.Round(slope*t1*1000))
 	return fmt.Sprintf("%.9f", op)

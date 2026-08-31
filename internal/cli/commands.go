@@ -558,10 +558,10 @@ func reportPlan(job rsync.Job, drifts map[string]rsync.Drift) {
 		}
 		ui.Field("source", fmt.Sprintf("%-34s %s", filepath.Base(c.File.Path), ui.Muted.Render(join(role))))
 		if c.Drift.DelayMS != 0 || c.Drift.Linear != "" {
-			msg := fmt.Sprintf("delay %dms", c.Drift.DelayMS)
+			msg := fmt.Sprintf("sync (ms) %+d", c.Drift.DelayMS)
 			if c.Drift.FPSStretch {
-				msg += fmt.Sprintf("  fps stretch %s", c.Drift.Linear)
-				ui.Warn(fmt.Sprintf("%s: frame-rate mismatch corrected (%s)", filepath.Base(c.File.Path), c.Drift.Linear))
+				msg += fmt.Sprintf("  scale %.9f  %s", c.Drift.Factor(), timingDescription(c.Drift.Factor()))
+				ui.Warn(fmt.Sprintf("%s: timing/FPS mismatch corrected (%s)", filepath.Base(c.File.Path), timingDescription(c.Drift.Factor())))
 			}
 			ui.Field("", ui.Accent.Render(msg))
 		}
@@ -573,14 +573,14 @@ func reportPlan(job rsync.Job, drifts map[string]rsync.Drift) {
 
 func hybridCmd() *cobra.Command {
 	var (
-		hdrPath   string
-		dvPath    string
-		plusPath  string
-		output    string
-		outDir    string
-		keep      bool
-		hevcOnly  bool
-		dryRun    bool
+		hdrPath  string
+		dvPath   string
+		plusPath string
+		output   string
+		outDir   string
+		keep     bool
+		hevcOnly bool
+		dryRun   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "hybrid (--hdr FILE --dv FILE | --dv FILE --hdr10plus FILE | --hdr10plus FILE)",

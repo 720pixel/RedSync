@@ -12,9 +12,14 @@ redistributed unmodified under the terms of the MIT License.
 Based on
 --------
 audio-offset-finder - https://github.com/bbc/audio-offset-finder (Apache-2.0)
+ffsubsync          - https://github.com/smacke/ffsubsync          (MIT License)
 
 Copyright (c) BBC. RedSync's offset detection follows the approach of
 audio-offset-finder; no BBC source code is included.
+
+RedSync's subtitle matcher is an original Go implementation informed by the
+language-independent activity-correlation method documented by ffsubsync. No
+ffsubsync source code is included.
 
 Required at runtime (not bundled)
 ---------------------------------

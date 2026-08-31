@@ -4,6 +4,29 @@ All notable changes to RedSync are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-01
+
+### Added
+
+- `RedSync sync <reference> <target...>` for standalone audio-to-audio and
+  subtitle-to-subtitle synchronization without a video track or MKVToolNix.
+- Batch targets and recursive directory scanning, format conversion, manual
+  shift/factor overrides, audio stream selection, confidence gates, dry runs
+  and JSON reports.
+- Multi-probe robust drift fitting for audio and language-independent FFT cue
+  activity alignment for SRT, WebVTT and FFmpeg-readable text subtitles.
+- Piecewise internal-edit detection and repair for audio and subtitles, with
+  explicit silence-insertion/target-removal gap records and final remeasurement.
+- Stable standalone JSON schema version 2 with segment, gap, language,
+  confidence/residual, and verification fields.
+- Optional audio bitrate, channel-count, sample-rate, codec and language output
+  controls for non-interactive integration pipelines.
+
+### Fixed
+
+- Corrected the direction of the exact video FPS timestamp ratio and inferred
+  audio drift factor.
+
 ## [0.1.0] - 2026-07-02
 
 Initial release.
@@ -52,3 +75,4 @@ Initial release.
   first run if it isn't already present.
 
 [0.1.0]: https://github.com/720pixel/RedSync/releases/tag/v0.1.0
+[0.2.0]: https://github.com/720pixel/RedSync/compare/v0.1.0...v0.2.0

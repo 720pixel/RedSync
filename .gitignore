@@ -9,3 +9,6 @@
 
 # local scratch
 /work/
+
+# local media fixtures and generated sync deliverables (may be copyrighted)
+/Test/

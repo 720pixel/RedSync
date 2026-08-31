@@ -30,13 +30,13 @@ type rootFlags struct {
 	output   string
 	outDir   string
 
-	quick      bool // --sync: treat positional files as quick source list
-	audioOnly  bool
-	subsOnly   bool
-	chapsOnly  bool
-	keep       bool // keep the video source's own audio + subs + chapters too
-	unique     bool // dedupe subtitles to one per language/role, merging in unique ones from every source
-	dryRun     bool
+	quick     bool // --sync: treat positional files as quick source list
+	audioOnly bool
+	subsOnly  bool
+	chapsOnly bool
+	keep      bool // keep the video source's own audio + subs + chapters too
+	unique    bool // dedupe subtitles to one per language/role, merging in unique ones from every source
+	dryRun    bool
 
 	shift    int  // manual constant delay (ms); bypasses audio measurement
 	shiftSet bool // whether --shift was supplied
@@ -96,7 +96,7 @@ func Execute() {
 	fl.BoolVar(&f.dryRun, "dry-run", false, "print the plan and mkvmerge command without writing anything")
 	fl.IntVar(&f.shift, "shift", 0, "set the sync offset manually in ms (skips audio measurement; can be negative)")
 
-	root.AddCommand(analyzeCmd(), hybridCmd(), doctorCmd())
+	root.AddCommand(analyzeCmd(), standaloneSyncCmd(), hybridCmd(), doctorCmd())
 
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		ui.Err(err.Error())
@@ -109,6 +109,8 @@ const helpBody = `
 Examples:
   RedSync movie/                         pick interactively from a folder
   RedSync a.mkv b.mkv --sync             quick: audio+subs+chapters from b onto a
+  RedSync sync english.m4a thai.mka      standalone audio: write thai.synced.mka
+  RedSync sync english.vtt *.srt --format vtt   batch-align subtitles to English
   RedSync a.mkv b.mkv --sync --subs-only just the subtitles from b
   RedSync a.mkv b.mkv c.mkv --sync --unique   subs from b+c, deduped to one per language/role
   RedSync --video a.mkv --audio b.mkv --subs c.mkv --chapters a.mkv

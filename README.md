@@ -32,6 +32,8 @@ Use it to:
 - Combine a DV source and a separate HDR10+ source into one DV HDR10+ hybrid
 - Convert HDR10+ to Dolby Vision
 - Sync audio, subtitles or chapters from one release onto the video of another
+- Create standalone synced audio from any two FFmpeg-readable audio sources
+- Align one or a whole folder of subtitles to a correctly timed reference
 - Remux tracks from several MKV sources into one file with correct timing
 - Set the sync offset by hand when you already know it (`--shift`)
 - Drive any of the above from a script and read the result back as JSON
@@ -44,6 +46,8 @@ Use it to:
 - [Quick start](#quick-start)
 - [How to add Dolby Vision to an HDR10 file](#how-to-add-dolby-vision-to-an-hdr10-file)
 - [How to sync audio from a different release](#how-to-sync-audio-from-a-different-release)
+- [Standalone audio and subtitle sync](#standalone-audio-and-subtitle-sync)
+- [Batch sync](#batch-sync)
 - [Scripting RedSync](#scripting-redsync)
 - [How the sync stays accurate](#how-the-sync-stays-accurate)
 - [How the hybrid crop is automatic](#how-the-hybrid-crop-is-automatic)
@@ -87,6 +91,9 @@ what is present and what is missing.
 | `mkvmerge`, `mkvextract`, `mkvpropedit` (MKVToolNix) | You install these. |
 | `mediainfo` | You install this. |
 
+Standalone `RedSync sync ...` only needs FFmpeg/FFprobe. MKVToolNix and
+MediaInfo are needed for the remux and hybrid features.
+
 Install the two you need:
 
 **Linux (Debian / Ubuntu)**
@@ -125,6 +132,25 @@ audio, subtitles and chapters:
 
 ```bash
 RedSync film_a.mkv film_b.mkv --sync
+```
+
+**Write a synced standalone audio file.** The correctly timed reference comes
+first and the audio to fix comes second. Input formats can differ:
+
+```bash
+RedSync sync english.m4a thai.mka
+# writes thai.synced.mka
+
+RedSync sync english.flac commentary.mp3 --format m4a
+# writes commentary.synced.m4a
+```
+
+**Align subtitles to a reference subtitle.** Text does not need to be in the
+same language:
+
+```bash
+RedSync sync english.vtt thai.srt --format vtt
+# writes thai.synced.vtt
 ```
 
 Narrow it with `--audio-only`, `--subs-only` or `--chapters-only`.
@@ -234,6 +260,83 @@ delay to every source being synced onto the video:
 RedSync a.mkv b.mkv --sync --shift -320
 ```
 
+## Standalone audio and subtitle sync
+
+The `sync` subcommand does not need a video track or MKVToolNix:
+
+```bash
+RedSync sync <correct-reference> <target-to-fix> [more-targets...]
+```
+
+For audio, RedSync decodes spectral probes from the beginning and across the
+runtime. It robustly fits the map from target timestamps to reference
+timestamps, separating a fixed offset from linear drift. Dense anchors also
+detect persistent internal discontinuities: reference-only sections become
+silence of the exact measured duration, while target-only sections are cut.
+An isolated weak probe is rejected instead of being treated as an edit. Speed
+candidates include the common 23.976/24/25/29.97/30 fps conversions and a
+factor inferred from file durations. FFmpeg's `atempo` corrects speed without
+changing pitch; padding or trimming makes the result exactly the reference
+duration.
+
+The output container follows the target by default. Use `--format mka`,
+`--format m4a`, `--format mp3`, `--format flac` or another FFmpeg-writable audio
+extension to convert while syncing. RedSync keeps the channel layout, language
+tag and source bitrate where the selected encoder supports them. Use `--codec`
+to choose an FFmpeg encoder explicitly. Integration pipelines can also set
+`--bitrate 96k`, `--channels 2`, `--sample-rate 48000`, and `--language tha`.
+
+For subtitles, RedSync turns both cue timelines into language-independent
+activity signals, searches offsets and speed ratios with FFT correlation, then
+refines the result against exact cue intervals. SRT and WebVTT are handled
+natively; other FFmpeg-readable text subtitle formats are normalized through
+FFmpeg. `--format vtt` and `--format srt` provide predictable interchange
+outputs.
+
+Useful controls:
+
+```bash
+RedSync sync ref.m4a target.mka --shift -5000 --factor 1.0
+RedSync sync ref.vtt target.srt --max-offset 600 --dry-run
+RedSync sync ref.mkv target.mka --reference-track 1 --target-track 0
+RedSync sync ref.m4a target.flac --format m4a --codec aac --bitrate 96k --channels 2 --sample-rate 48000 --language tha
+```
+
+`--shift` is the correction applied to the target: a negative value advances
+it. `--factor` multiplies target timestamps (less than 1 speeds a long target
+up; greater than 1 slows a short target down). Supplying either option bypasses
+automatic measurement.
+
+Internal edit repair is enabled by default. `--min-gap 0.35` controls the
+smallest discontinuity that can become a segment boundary, and
+`--max-segments 8` is the safety cap. Use `--detect-gaps=false` when a known
+workflow explicitly requires one affine map. Finished files are re-measured by
+default; `--verify=false` is available for callers that perform their own
+independent verification.
+
+## Batch sync
+
+Pass several targets, shell globs, or directories. Directories are scanned
+recursively and existing `*.synced.*` files are skipped:
+
+```bash
+RedSync sync english.vtt subtitles/ --format vtt --out-dir synced-subs/
+RedSync sync english.m4a thai.mka japanese.flac spanish.mp3 --out-dir synced-audio/
+```
+
+Every target is measured independently. This matters when a folder mixes
+releases with different offsets or frame-rate conversions. `--output` is only
+valid for one target; use `--out-dir` for a batch. Existing files are protected
+unless `--overwrite` is given. Each result clearly reports `sync (ms)`, the
+timestamp scale, detected FPS conversion (or arbitrary drift in ppm), confidence
+and output path. JSON schema version 2 preserves `sync_ms`, `scale`,
+`drift_ppm` and `fps_conversion`, and adds `language`, `segments`, `gaps`, and
+`verification`. Each gap has an `action` of `insert_silence` or
+`remove_target`, its signed `delta_ms`, absolute `duration_ms`, and target and
+reference boundary timestamps. Verification reports the remaining offset,
+scale/drift, confidence, residual, reference/output duration and delta,
+remaining gaps, and a `passed` gate.
+
 ## Scripting RedSync
 
 Every command is non-interactive when you pass explicit flags, and `--json`
@@ -246,6 +349,8 @@ RedSync analyze --json *.mkv                       # tracks, fps, HDR/DV per fil
 RedSync doctor --json                              # tool availability + paths
 RedSync hybrid --dv dv.mkv --hdr10plus hdr.mkv --json
 RedSync a.mkv b.mkv --sync --json                  # output path, offsets, timings
+RedSync sync english.m4a thai.mka --json            # standalone audio result
+RedSync sync english.vtt subtitles/ --format vtt --json  # subtitle batch results
 ```
 
 A run's JSON reports the output filename, the final dynamic-range tag, the delay
@@ -257,8 +362,10 @@ writing anything, or `--quiet` to keep the pretty output but drop the spinners.
 
 The offset between two tracks comes from their audio. RedSync decodes a short
 window from each, builds a log-mel energy envelope, and cross-correlates them
-with an FFT. The peak is the delay, and how sharp that peak is says how far to
-trust it.
+with an FFT. Standalone sync samples up to 25 positions and uses a robust
+piecewise fit, so one weak scene does not decide the result and genuine edits
+remain distinct from clock drift. The peak is the delay, and how sharp that
+peak is says how far to trust it.
 
 It checks two points in the runtime. The same delay at both means a constant
 offset that goes straight into `mkvmerge --sync`. Different delays mean the
@@ -316,6 +423,9 @@ RedSync would not exist without these projects:
   HDR10+ metadata extraction. Bundled in the binary.
 - **[audio-offset-finder](https://github.com/bbc/audio-offset-finder)** by the
   BBC - the audio cross-correlation approach RedSync's offset engine is based on.
+- **[ffsubsync](https://github.com/smacke/ffsubsync)** by Stephen Macke - its
+  documented language-independent subtitle activity approach informed RedSync's
+  original Go subtitle matcher. No ffsubsync source code is included.
 
 Also relies on [FFmpeg](https://ffmpeg.org),
 [MKVToolNix](https://mkvtoolnix.download) and

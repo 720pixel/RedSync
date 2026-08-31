@@ -103,12 +103,15 @@ type jsonRun struct {
 }
 
 type jsonSource struct {
-	Path       string   `json:"path"`
-	Roles      []string `json:"roles"`
-	DelayMS    int      `json:"delay_ms"`
-	Linear     string   `json:"linear,omitempty"`
-	FPSStretch bool     `json:"fps_stretch"`
-	Score      float64  `json:"score,omitempty"`
+	Path          string   `json:"path"`
+	Roles         []string `json:"roles"`
+	DelayMS       int      `json:"delay_ms"`
+	Linear        string   `json:"linear,omitempty"`
+	Scale         float64  `json:"scale"`
+	DriftPPM      float64  `json:"drift_ppm"`
+	FPSConversion string   `json:"fps_conversion"`
+	FPSStretch    bool     `json:"fps_stretch"`
+	Score         float64  `json:"score,omitempty"`
 }
 
 func buildRunJSON(job rsync.Job, sel selection, rng string, stages []stageTime, total time.Duration) jsonRun {
@@ -139,12 +142,15 @@ func buildRunJSON(job rsync.Job, sel selection, rng string, stages []stageTime, 
 			roles = append(roles, "chapters")
 		}
 		r.Sources = append(r.Sources, jsonSource{
-			Path:       c.File.Path,
-			Roles:      roles,
-			DelayMS:    c.Drift.DelayMS,
-			Linear:     c.Drift.Linear,
-			FPSStretch: c.Drift.FPSStretch,
-			Score:      c.Drift.Score,
+			Path:          c.File.Path,
+			Roles:         roles,
+			DelayMS:       c.Drift.DelayMS,
+			Linear:        c.Drift.Linear,
+			Scale:         c.Drift.Factor(),
+			DriftPPM:      (c.Drift.Factor() - 1) * 1_000_000,
+			FPSConversion: timingDescription(c.Drift.Factor()),
+			FPSStretch:    c.Drift.FPSStretch,
+			Score:         c.Drift.Score,
 		})
 	}
 	return r

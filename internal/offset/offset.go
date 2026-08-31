@@ -24,7 +24,10 @@ const (
 
 // Result is what a single comparison gives back.
 type Result struct {
-	Offset float64 // seconds. positive => second file starts later than the first
+	// Offset is the timestamp adjustment to apply to the second signal so it
+	// lines up with the first. A second file that starts five seconds late gets
+	// -5 here (trim/advance it by five seconds).
+	Offset float64
 	Score  float64 // z-score of the peak. higher is more trustworthy, ~8+ is solid
 }
 
@@ -39,6 +42,26 @@ func (r Result) Millis() int {
 func Find(a, b []float64) (Result, error) {
 	fa := envelope(a)
 	fb := envelope(b)
+	return findEnvelopes(fa, fb)
+}
+
+// FindScaled is Find with a temporal scale applied to b's feature frames before
+// correlation. Spectral bands are left untouched, so it models a pitch-
+// preserving tempo correction (the same operation RenderAudio later performs
+// with FFmpeg's atempo filter).
+func FindScaled(a, b []float64, scale float64) (Result, error) {
+	fa := envelope(a)
+	fb := envelope(b)
+	if scale <= 0 {
+		return Result{}, fmt.Errorf("invalid time scale %.9f", scale)
+	}
+	if math.Abs(scale-1) > 0.0000005 {
+		fb = resampleFrames(fb, scale)
+	}
+	return findEnvelopes(fa, fb)
+}
+
+func findEnvelopes(fa, fb [][]float64) (Result, error) {
 	if len(fa) == 0 || len(fb) == 0 {
 		return Result{}, fmt.Errorf("not enough audio to compare")
 	}
@@ -64,6 +87,33 @@ func Find(a, b []float64) (Result, error) {
 	lag := idx - (len(fb) - 1)
 	secs := float64(lag) * float64(hopLen) / float64(sampleRate)
 	return Result{Offset: secs, Score: score}, nil
+}
+
+func resampleFrames(in [][]float64, scale float64) [][]float64 {
+	if len(in) < 2 {
+		return in
+	}
+	n := int(math.Round(float64(len(in)) * scale))
+	if n < 2 {
+		n = 2
+	}
+	out := make([][]float64, n)
+	for i := range out {
+		pos := float64(i) / scale
+		lo := int(math.Floor(pos))
+		if lo >= len(in)-1 {
+			lo = len(in) - 1
+			out[i] = append([]float64(nil), in[lo]...)
+			continue
+		}
+		frac := pos - float64(lo)
+		row := make([]float64, len(in[lo]))
+		for band := range row {
+			row[band] = in[lo][band]*(1-frac) + in[lo+1][band]*frac
+		}
+		out[i] = row
+	}
+	return out
 }
 
 // envelope turns a raw signal into a [frames][nBands] log-energy matrix,
