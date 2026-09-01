@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,67 @@ import (
 	"github.com/720pixel/RedSync/internal/subtitle"
 	"github.com/720pixel/RedSync/internal/timeline"
 )
+
+func TestSiblingVerificationReferenceRequiresVerifiedPlanRendering(t *testing.T) {
+	tests := []struct {
+		name string
+		flag standaloneFlags
+		want string
+	}{
+		{
+			name: "plan required",
+			flag: standaloneFlags{verificationReference: "anchor.mka", verify: true, minGap: 0.35, maxSegments: 8, semanticCodexTimeout: time.Second},
+			want: "requires --alignment-plan",
+		},
+		{
+			name: "render required",
+			flag: standaloneFlags{alignmentPlan: "plan.json", verificationReference: "anchor.mka", verify: true, dryRun: true, minGap: 0.35, maxSegments: 8, semanticCodexTimeout: time.Second},
+			want: "requires output rendering",
+		},
+		{
+			name: "verification required",
+			flag: standaloneFlags{alignmentPlan: "plan.json", verificationReference: "anchor.mka", minGap: 0.35, maxSegments: 8, semanticCodexTimeout: time.Second},
+			want: "--verify=true",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runStandaloneSync(context.Background(), "missing-reference", []string{"missing-target"}, &tc.flag, false, false)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestVerifyPlannedSubtitleOutputChecksExactTransformedCues(t *testing.T) {
+	ctx := context.Background()
+	expected := []subtitle.Cue{
+		{Start: 1500 * time.Millisecond, End: 2750 * time.Millisecond, Text: []string{"Pierwsza linia"}},
+		{Start: 5 * time.Second, End: 6500 * time.Millisecond, Text: []string{"Druga", "linia"}},
+	}
+	output := filepath.Join(t.TempDir(), "polish.vtt")
+	if err := subtitle.Write(ctx, output, expected, true); err != nil {
+		t.Fatal(err)
+	}
+	verification, err := verifyPlannedSubtitleOutput(ctx, expected, output)
+	if err != nil || !verification.Passed || verification.SyncMS != 0 || verification.ResidualMS != 0 {
+		t.Fatalf("exact planned output rejected: verification=%+v err=%v", verification, err)
+	}
+
+	shifted := append([]subtitle.Cue(nil), expected...)
+	shifted[1].Start += 200 * time.Millisecond
+	if err := subtitle.Write(ctx, output, shifted, true); err != nil {
+		t.Fatal(err)
+	}
+	verification, err = verifyPlannedSubtitleOutput(ctx, expected, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.Passed || verification.ResidualMS != 200 {
+		t.Fatalf("shifted planned output accepted: %+v", verification)
+	}
+}
 
 func validTestAlignmentPlan(t *testing.T) (alignmentPlan, string) {
 	t.Helper()

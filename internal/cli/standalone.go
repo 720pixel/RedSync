@@ -20,57 +20,59 @@ import (
 )
 
 type standaloneFlags struct {
-	output               string
-	outDir               string
-	format               string
-	codec                string
-	bitrate              string
-	channels             int
-	sampleRate           int
-	language             string
-	dryRun               bool
-	overwrite            bool
-	force                bool
-	verify               bool
-	detectGaps           bool
-	shift                int
-	factor               float64
-	maxOffset            float64
-	minScore             float64
-	minGap               float64
-	maxSegments          int
-	referenceTrack       int
-	targetTrack          int
-	semanticCodexModel   string
-	semanticCodexBin     string
-	semanticCodexTimeout time.Duration
-	semanticWindow       float64
-	alignmentPlan        string
-	writePlan            string
-	eventsJSON           bool
-	eventWriter          io.Writer
+	output                string
+	outDir                string
+	format                string
+	codec                 string
+	bitrate               string
+	channels              int
+	sampleRate            int
+	language              string
+	dryRun                bool
+	overwrite             bool
+	force                 bool
+	verify                bool
+	detectGaps            bool
+	shift                 int
+	factor                float64
+	maxOffset             float64
+	minScore              float64
+	minGap                float64
+	maxSegments           int
+	referenceTrack        int
+	targetTrack           int
+	semanticCodexModel    string
+	semanticCodexBin      string
+	semanticCodexTimeout  time.Duration
+	semanticWindow        float64
+	alignmentPlan         string
+	verificationReference string
+	writePlan             string
+	eventsJSON            bool
+	eventWriter           io.Writer
 }
 
 type standaloneResult struct {
-	SchemaVersion int                     `json:"schema_version"`
-	Mode          string                  `json:"mode"`
-	Reference     string                  `json:"reference"`
-	Target        string                  `json:"target"`
-	Output        string                  `json:"output"`
-	Method        string                  `json:"method,omitempty"`
-	Language      string                  `json:"language,omitempty"`
-	DryRun        bool                    `json:"dry_run"`
-	SyncMS        int                     `json:"sync_ms"`
-	Scale         float64                 `json:"scale"`
-	DriftPPM      float64                 `json:"drift_ppm"`
-	FPSConversion string                  `json:"fps_conversion"`
-	Score         float64                 `json:"score"`
-	OriginalScore float64                 `json:"original_score,omitempty"`
-	Samples       int                     `json:"samples"`
-	ResidualMS    int                     `json:"residual_ms"`
-	Segments      []timeline.Segment      `json:"segments"`
-	Gaps          []timeline.Gap          `json:"gaps"`
-	Verification  *standaloneVerification `json:"verification,omitempty"`
+	SchemaVersion         int                     `json:"schema_version"`
+	Mode                  string                  `json:"mode"`
+	Reference             string                  `json:"reference"`
+	Target                string                  `json:"target"`
+	Output                string                  `json:"output"`
+	Method                string                  `json:"method,omitempty"`
+	Language              string                  `json:"language,omitempty"`
+	DryRun                bool                    `json:"dry_run"`
+	SyncMS                int                     `json:"sync_ms"`
+	Scale                 float64                 `json:"scale"`
+	DriftPPM              float64                 `json:"drift_ppm"`
+	FPSConversion         string                  `json:"fps_conversion"`
+	Score                 float64                 `json:"score"`
+	OriginalScore         float64                 `json:"original_score,omitempty"`
+	Samples               int                     `json:"samples"`
+	ResidualMS            int                     `json:"residual_ms"`
+	Segments              []timeline.Segment      `json:"segments"`
+	Gaps                  []timeline.Gap          `json:"gaps"`
+	Verification          *standaloneVerification `json:"verification,omitempty"`
+	VerificationReference string                  `json:"verification_reference,omitempty"`
 }
 
 type standaloneVerification struct {
@@ -133,6 +135,7 @@ through FFmpeg; subtitles are aligned from language-independent cue activity.`,
 	fl.DurationVar(&f.semanticCodexTimeout, "semantic-codex-timeout", 45*time.Second, "maximum time for sparse Codex semantic matching")
 	fl.Float64Var(&f.semanticWindow, "semantic-window", 0, "semantic candidate window in seconds (default: max of 120 and --max-offset)")
 	fl.StringVar(&f.alignmentPlan, "alignment-plan", "", "reuse a verified local timeline plan instead of measuring this target")
+	fl.StringVar(&f.verificationReference, "verification-reference", "", "verify a planned audio sibling against the rendered anchor instead of the original reference")
 	fl.StringVar(&f.writePlan, "write-alignment-plan", "", "write the verified single-target timeline to a local JSON plan")
 	fl.BoolVar(&f.eventsJSON, "events-json", false, "emit prefixed one-line JSON progress events on stderr")
 	return cmd
@@ -153,6 +156,12 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	}
 	if f.alignmentPlan != "" && (shiftSet || factorSet || f.semanticCodexModel != "" || f.writePlan != "") {
 		return fmt.Errorf("--alignment-plan cannot be combined with manual shift/factor, --semantic-codex-model, or --write-alignment-plan")
+	}
+	if f.verificationReference != "" && f.alignmentPlan == "" {
+		return fmt.Errorf("--verification-reference requires --alignment-plan")
+	}
+	if f.verificationReference != "" && (f.dryRun || !f.verify) {
+		return fmt.Errorf("--verification-reference requires output rendering and --verify=true")
 	}
 	if f.writePlan != "" && (f.dryRun || !f.verify) {
 		return fmt.Errorf("--write-alignment-plan requires output rendering and --verify=true")
@@ -185,6 +194,9 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	}
 
 	if mode == "subtitles" {
+		if f.verificationReference != "" {
+			return fmt.Errorf("--verification-reference is only valid for audio")
+		}
 		return syncSubtitleTargets(ctx, reference, targets, f, shiftSet, factorSet)
 	}
 	return syncAudioTargets(ctx, reference, targets, f, shiftSet, factorSet)
@@ -198,6 +210,20 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 	refTrack, err := chooseAudioTrack(ref, f.referenceTrack)
 	if err != nil {
 		return fmt.Errorf("reference: %w", err)
+	}
+	verificationRef := ref
+	verificationTrack := refTrack
+	verificationReference := ""
+	if f.verificationReference != "" {
+		verificationRef, err = media.Probe(ctx, f.verificationReference)
+		if err != nil {
+			return fmt.Errorf("verification reference: %w", err)
+		}
+		verificationTrack, err = chooseAudioTrack(verificationRef, -1)
+		if err != nil {
+			return fmt.Errorf("verification reference: %w", err)
+		}
+		verificationReference = f.verificationReference
 	}
 	var reusablePlan *alignmentPlan
 	if f.alignmentPlan != "" {
@@ -302,7 +328,7 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 				ui.Step("verifying the finished audio")
 				verificationStarted := time.Now()
 				events.emit("verification_started", nil)
-				verification, err = verifyAudioOutput(ctx, ref, refTrack, output, f)
+				verification, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f)
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
 				}
@@ -333,7 +359,7 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 			SyncMS: drift.DelayMS, Scale: drift.Factor(), DriftPPM: (drift.Factor() - 1) * 1_000_000,
 			FPSConversion: timingDescription(drift.Factor()), Score: drift.Score,
 			Samples: drift.Samples, ResidualMS: drift.ResidualMS, Segments: nonNilSegments(drift.Segments),
-			Gaps: nonNilGaps(drift.Gaps), Verification: verification,
+			Gaps: nonNilGaps(drift.Gaps), Verification: verification, VerificationReference: verificationReference,
 		})
 		events.emit("target_complete", func(e *standaloneEvent) {
 			e.DryRun = boolPtr(f.dryRun)
@@ -466,7 +492,16 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 				ui.Step("verifying the finished subtitles")
 				verificationStarted := time.Now()
 				events.emit("verification_started", nil)
-				verification, err = verifySubtitleOutput(ctx, refCues, output, f, semanticMatcher)
+				if reusablePlan != nil {
+					// A verified sibling plan already established the source-to-reference
+					// timeline with the English anchor. Re-aligning translated cue activity
+					// against English here produces false residuals when translations split
+					// or merge cues differently. Verify the deterministic plan render itself:
+					// every cue, timestamp and line must survive exactly as transformed.
+					verification, err = verifyPlannedSubtitleOutput(ctx, synced, output)
+				} else {
+					verification, err = verifySubtitleOutput(ctx, refCues, output, f, semanticMatcher)
+				}
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
 				}
@@ -573,6 +608,45 @@ func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output 
 		Samples: a.Samples, ResidualMS: a.ResidualMS,
 		ReferenceDurationSeconds: referenceEnd, OutputDurationSeconds: outputEnd, DurationDeltaMS: durationDelta,
 		Gaps: nonNilGaps(a.Gaps),
+	}, nil
+}
+
+func verifyPlannedSubtitleOutput(ctx context.Context, expected []subtitle.Cue, output string) (*standaloneVerification, error) {
+	finished, err := subtitle.Read(ctx, output)
+	if err != nil {
+		return nil, err
+	}
+	_, expectedEnd := subtitleCueBounds(expected)
+	_, outputEnd := subtitleCueBounds(finished)
+	durationDelta := int(math.Round((outputEnd - expectedEnd) * 1000))
+	matching := len(expected) > 0 && len(expected) == len(finished)
+	maxDeltaMS := 0
+	syncMS := 0
+	if len(expected) > 0 && len(finished) > 0 {
+		syncMS = int(math.Round(float64(finished[0].Start-expected[0].Start) / float64(time.Millisecond)))
+	}
+	if matching {
+		for i := range expected {
+			startDelta := absInt(int(math.Round(float64(finished[i].Start-expected[i].Start) / float64(time.Millisecond))))
+			endDelta := absInt(int(math.Round(float64(finished[i].End-expected[i].End) / float64(time.Millisecond))))
+			maxDeltaMS = max(maxDeltaMS, startDelta, endDelta)
+			if strings.Join(finished[i].Text, "\n") != strings.Join(expected[i].Text, "\n") {
+				matching = false
+				break
+			}
+		}
+	}
+	passed := matching && maxDeltaMS <= 2
+	score := 0.0
+	if passed {
+		score = 1
+	}
+	return &standaloneVerification{
+		Passed: passed, SyncMS: syncMS, Scale: 1, DriftPPM: 0,
+		FPSConversion: timingDescription(1), Score: score,
+		Samples: min(len(expected), len(finished)), ResidualMS: maxDeltaMS,
+		ReferenceDurationSeconds: expectedEnd, OutputDurationSeconds: outputEnd, DurationDeltaMS: durationDelta,
+		Gaps: []timeline.Gap{},
 	}, nil
 }
 
