@@ -293,6 +293,45 @@ natively; other FFmpeg-readable text subtitle formats are normalized through
 FFmpeg. `--format vtt` and `--format srt` provide predictable interchange
 outputs.
 
+### Extreme cross-language subtitle alignment
+
+When audio is unavailable and English and translated subtitle activity differs
+too much, `--semantic-codex-model` enables the exceptional cross-language path.
+It reuses the local Codex CLI login and launches one short-lived, ephemeral,
+read-only process from the system temporary directory. CinemaCity uses the
+`gpt-5.4-mini` model with low reasoning effort. In the production Hindi SDH
+23.976/25 FPS fixture it produced more than twice as many clean anchors as
+Spark, while the extra latency remains isolated to this rare fallback:
+
+```bash
+RedSync sync english.vtt tamil.srt \
+  --semantic-codex-model gpt-5.4-mini \
+  --format vtt --json --events-json
+```
+
+RedSync samples distinctive English dialogue across the complete programme and
+sends only those sparse entries plus nearby one/two-cue target candidates. The
+prompt asks Codex to identify unambiguous translated meaning while ignoring
+target-only SDH sounds, speaker labels, repeated short lines and timestamp
+differences. It does not ask AI to translate the full subtitle or calculate
+timings.
+
+After the sparse matches return, deterministic code extracts the strongest
+monotonic chain, calculates exact fixed delay and arbitrary linear clock/FPS
+drift (including 23.976/24/25), detects supported internal edits, removes timing
+outliers, renders the file and remeasures the output. Verification reuses the
+same semantic matches, so each target normally makes one Codex call. Live
+`--events-json` output explicitly announces both the AI start (including model)
+and the handoff back to deterministic timing.
+
+`--semantic-window` limits candidate timing hypotheses,
+`--semantic-codex-timeout` bounds the subprocess, and `--semantic-codex-bin`
+selects the CLI executable. Without `--semantic-codex-model`, Codex is never
+invoked and the built-in cue-activity matcher is unchanged. This mode is meant
+for private, rare recovery jobs; normal CinemaCity jobs use audio or a target
+English subtitle as the verified anchor and replay that exact timing plan for
+all sibling languages.
+
 Useful controls:
 
 ```bash
@@ -300,6 +339,7 @@ RedSync sync ref.m4a target.mka --shift -5000 --factor 1.0
 RedSync sync ref.vtt target.srt --max-offset 600 --dry-run
 RedSync sync ref.mkv target.mka --reference-track 1 --target-track 0
 RedSync sync ref.m4a target.flac --format m4a --codec aac --bitrate 96k --channels 2 --sample-rate 48000 --language tha
+RedSync sync english.vtt telugu.srt --semantic-codex-model gpt-5.4-mini --dry-run
 ```
 
 `--shift` is the correction applied to the target: a negative value advances
@@ -337,6 +377,42 @@ reference boundary timestamps. Verification reports the remaining offset,
 scale/drift, confidence, residual, reference/output duration and delta,
 remaining gaps, and a `passed` gate.
 
+### Reuse one verified source timeline
+
+Tracks extracted from the same release share one timeline even when their
+languages differ. Measure a reliable anchor—normally that source's English
+track—once, then export its exact verified mapping:
+
+```bash
+RedSync sync cc-english.m4a source-english.mka \
+  --write-alignment-plan source-s01e01.timeline.json --json
+```
+
+The plan is written only after normal output verification passes. It contains
+schema version 1, the affine shift/scale, every piecewise segment and internal
+gap, confidence metadata, the verification gate, source/reference durations,
+and a SHA-256 digest of the reference. It stores basenames rather than absolute
+paths.
+
+Apply that exact mapping to sibling tracks from the same source release:
+
+```bash
+RedSync sync cc-english.m4a source-hindi.mka \
+  --alignment-plan source-s01e01.timeline.json
+RedSync sync cc-english.m4a source-tamil.mka source-telugu.mka \
+  --alignment-plan source-s01e01.timeline.json --out-dir synced/
+```
+
+Plan reuse skips measurement but not rendering or final verification. Before
+rendering, RedSync rejects unknown schema fields, an unverified plan, media-type
+mismatch, a different reference digest/duration, unsafe scale, overlapping or
+non-monotonic segments, inconsistent reference bounds, malformed gaps, and—for
+audio—a sibling duration inconsistent with the anchor source. Subtitle sibling
+durations are not required to match because languages commonly omit signs,
+songs, or end credits. `--alignment-plan` cannot be combined with manual
+shift/factor, semantic measurement, or plan export. Existing behavior is
+unchanged when neither plan flag is present.
+
 ## Scripting RedSync
 
 Every command is non-interactive when you pass explicit flags, and `--json`
@@ -351,6 +427,23 @@ RedSync hybrid --dv dv.mkv --hdr10plus hdr.mkv --json
 RedSync a.mkv b.mkv --sync --json                  # output path, offsets, timings
 RedSync sync english.m4a thai.mka --json            # standalone audio result
 RedSync sync english.vtt subtitles/ --format vtt --json  # subtitle batch results
+```
+
+Long-running standalone sync callers can add `--events-json`. RedSync then
+keeps the final `--json` result unchanged on stdout and writes one compact JSON
+event per line to stderr, prefixed with `[redsync-event] `. The event sequence
+for each target is `target_started`, `measuring_started`,
+`measuring_complete`, `rendering_started`, `rendering_complete`, optional
+`verification_started` and `verification_complete`, then `target_complete`.
+Measurement and completion events include the detected offset, scale,
+confidence, samples, residual and edit counts; verification includes the
+`passed` gate. Every event has stable `target`, `current`, `total`, and
+human-readable `message` fields (with `index` retained as an alias for
+`current`).
+Only basenames are included, so live logs do not expose source directory paths.
+
+```bash
+RedSync sync english.m4a tamil.mka --json --events-json
 ```
 
 A run's JSON reports the output filename, the final dynamic-range tag, the delay

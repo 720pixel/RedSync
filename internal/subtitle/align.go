@@ -14,6 +14,7 @@ import (
 // reference = target*Scale + OffsetMS. It handles fixed delays, arbitrary
 // duration drift, and the usual film/TV frame-rate conversions.
 type Alignment struct {
+	Method        string
 	OffsetMS      int
 	Scale         float64
 	Score         float64
@@ -125,6 +126,7 @@ func Align(reference, target []Cue, opts AlignOptions) (Alignment, error) {
 		bestScale, bestOffset, bestScore = 1, 0, original
 	}
 	global := Alignment{
+		Method:        "activity",
 		OffsetMS:      int(math.Round(bestOffset * 1000)),
 		Scale:         bestScale,
 		Score:         bestScore,

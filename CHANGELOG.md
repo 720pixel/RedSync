@@ -21,6 +21,16 @@ All notable changes to RedSync are documented here. The format follows
   confidence/residual, and verification fields.
 - Optional audio bitrate, channel-count, sample-rate, codec and language output
   controls for non-interactive integration pipelines.
+- Opt-in `sync --events-json` progress events on stderr for live integrations,
+  without changing the final `--json` document on stdout.
+- Exceptional Codex 5.4 mini multilingual subtitle-anchor matching for no-audio,
+  no-target-English workflows. It sends only sparse candidate cues through an
+  ephemeral read-only CLI process, reports AI use in structured live events,
+  and leaves FPS/delay/internal-edit fitting and output verification to the
+  deterministic engine.
+- Export and reuse verified schema-versioned alignment plans so sibling tracks
+  from one source release inherit the anchor's exact affine and piecewise
+  timeline while retaining normal output verification.
 
 ### Fixed
 

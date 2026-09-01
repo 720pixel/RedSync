@@ -12,3 +12,4 @@
 
 # local media fixtures and generated sync deliverables (may be copyrighted)
 /Test/
+.grepai/

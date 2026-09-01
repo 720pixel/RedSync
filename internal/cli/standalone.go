@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -19,27 +20,35 @@ import (
 )
 
 type standaloneFlags struct {
-	output         string
-	outDir         string
-	format         string
-	codec          string
-	bitrate        string
-	channels       int
-	sampleRate     int
-	language       string
-	dryRun         bool
-	overwrite      bool
-	force          bool
-	verify         bool
-	detectGaps     bool
-	shift          int
-	factor         float64
-	maxOffset      float64
-	minScore       float64
-	minGap         float64
-	maxSegments    int
-	referenceTrack int
-	targetTrack    int
+	output               string
+	outDir               string
+	format               string
+	codec                string
+	bitrate              string
+	channels             int
+	sampleRate           int
+	language             string
+	dryRun               bool
+	overwrite            bool
+	force                bool
+	verify               bool
+	detectGaps           bool
+	shift                int
+	factor               float64
+	maxOffset            float64
+	minScore             float64
+	minGap               float64
+	maxSegments          int
+	referenceTrack       int
+	targetTrack          int
+	semanticCodexModel   string
+	semanticCodexBin     string
+	semanticCodexTimeout time.Duration
+	semanticWindow       float64
+	alignmentPlan        string
+	writePlan            string
+	eventsJSON           bool
+	eventWriter          io.Writer
 }
 
 type standaloneResult struct {
@@ -48,6 +57,7 @@ type standaloneResult struct {
 	Reference     string                  `json:"reference"`
 	Target        string                  `json:"target"`
 	Output        string                  `json:"output"`
+	Method        string                  `json:"method,omitempty"`
 	Language      string                  `json:"language,omitempty"`
 	DryRun        bool                    `json:"dry_run"`
 	SyncMS        int                     `json:"sync_ms"`
@@ -118,6 +128,13 @@ through FFmpeg; subtitles are aligned from language-independent cue activity.`,
 	fl.IntVar(&f.maxSegments, "max-segments", 8, "maximum piecewise timeline segments")
 	fl.IntVar(&f.referenceTrack, "reference-track", -1, "reference audio stream index (default: first audio stream)")
 	fl.IntVar(&f.targetTrack, "target-track", -1, "target audio stream index (default: first audio stream)")
+	fl.StringVar(&f.semanticCodexModel, "semantic-codex-model", "", "Codex model for the exceptional no-audio cross-language subtitle matcher")
+	fl.StringVar(&f.semanticCodexBin, "semantic-codex-bin", "codex", "Codex CLI executable for --semantic-codex-model")
+	fl.DurationVar(&f.semanticCodexTimeout, "semantic-codex-timeout", 45*time.Second, "maximum time for sparse Codex semantic matching")
+	fl.Float64Var(&f.semanticWindow, "semantic-window", 0, "semantic candidate window in seconds (default: max of 120 and --max-offset)")
+	fl.StringVar(&f.alignmentPlan, "alignment-plan", "", "reuse a verified local timeline plan instead of measuring this target")
+	fl.StringVar(&f.writePlan, "write-alignment-plan", "", "write the verified single-target timeline to a local JSON plan")
+	fl.BoolVar(&f.eventsJSON, "events-json", false, "emit prefixed one-line JSON progress events on stderr")
 	return cmd
 }
 
@@ -130,6 +147,15 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	}
 	if f.maxSegments < 1 || f.maxSegments > 32 {
 		return fmt.Errorf("--max-segments must be between 1 and 32")
+	}
+	if f.semanticWindow < 0 || f.semanticCodexTimeout <= 0 {
+		return fmt.Errorf("semantic window cannot be negative and Codex timeout must be greater than zero")
+	}
+	if f.alignmentPlan != "" && (shiftSet || factorSet || f.semanticCodexModel != "" || f.writePlan != "") {
+		return fmt.Errorf("--alignment-plan cannot be combined with manual shift/factor, --semantic-codex-model, or --write-alignment-plan")
+	}
+	if f.writePlan != "" && (f.dryRun || !f.verify) {
+		return fmt.Errorf("--write-alignment-plan requires output rendering and --verify=true")
 	}
 	info, err := os.Stat(reference)
 	if err != nil {
@@ -154,6 +180,9 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	if f.output != "" && len(targets) != 1 {
 		return fmt.Errorf("--output can only be used with one target; use --out-dir for a batch")
 	}
+	if f.writePlan != "" && len(targets) != 1 {
+		return fmt.Errorf("--write-alignment-plan requires exactly one target")
+	}
 
 	if mode == "subtitles" {
 		return syncSubtitleTargets(ctx, reference, targets, f, shiftSet, factorSet)
@@ -170,12 +199,26 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 	if err != nil {
 		return fmt.Errorf("reference: %w", err)
 	}
+	var reusablePlan *alignmentPlan
+	if f.alignmentPlan != "" {
+		plan, err := readAlignmentPlan(f.alignmentPlan, "audio", reference, ref.Duration)
+		if err != nil {
+			return err
+		}
+		reusablePlan = &plan
+	}
 	var results []standaloneResult
 	if len(targets) > 1 {
 		ui.Section("audio batch")
 		ui.Field("targets", fmt.Sprintf("%d files", len(targets)))
 	}
-	for _, targetPath := range targets {
+	for targetIndex, targetPath := range targets {
+		output := standaloneOutput(targetPath, f, "audio")
+		events := newStandaloneEventEmitter(f, "audio", reference, targetPath, output, targetIndex+1, len(targets))
+		targetStarted := time.Now()
+		events.emit("target_started", func(e *standaloneEvent) {
+			e.DryRun = boolPtr(f.dryRun)
+		})
 		target, err := media.Probe(ctx, targetPath)
 		if err != nil {
 			return fmt.Errorf("target %s: %w", filepath.Base(targetPath), err)
@@ -184,15 +227,27 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 		if err != nil {
 			return fmt.Errorf("target %s: %w", filepath.Base(targetPath), err)
 		}
-		output := standaloneOutput(targetPath, f, "audio")
 		ui.Section("audio sync")
 		ui.Field("reference", filepath.Base(reference))
 		ui.Field("target", filepath.Base(targetPath))
 
 		var drift rsync.Drift
-		if shiftSet || factorSet {
+		measurementStarted := time.Now()
+		events.emit("measuring_started", func(e *standaloneEvent) {
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+		})
+		method := "measured"
+		if reusablePlan != nil {
+			if !sameSourceDuration(reusablePlan.AnchorDurationSeconds, target.Duration) {
+				return fmt.Errorf("alignment plan anchor duration %.3fs does not match sibling %s duration %.3fs", reusablePlan.AnchorDurationSeconds, filepath.Base(targetPath), target.Duration)
+			}
+			ui.Step("applying verified sibling timeline plan")
+			drift = reusablePlan.drift()
+			method = "plan"
+		} else if shiftSet || factorSet {
 			drift.DelayMS = f.shift
 			drift.Scale = f.factor
+			method = "manual"
 			if math.Abs(f.factor-1) > 0.0000005 {
 				drift.Linear = fmt.Sprintf("%.9f", f.factor)
 				drift.FPSStretch = true
@@ -214,7 +269,13 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 				return err
 			}
 		}
+		events.emit("measuring_complete", func(e *standaloneEvent) {
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+			setDriftEventMetrics(e, drift)
+			e.ElapsedMS = int64Ptr(time.Since(measurementStarted).Milliseconds())
+		})
 		ui.Field("sync (ms)", fmt.Sprintf("%+d", drift.DelayMS))
+		ui.Field("method", method)
 		ui.Field("scale", fmt.Sprintf("%.9f", drift.Factor()))
 		ui.Field("FPS / timing", timingDescription(drift.Factor()))
 		if drift.Score > 0 {
@@ -225,19 +286,41 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 		var verification *standaloneVerification
 		if !f.dryRun {
 			ui.Step("rendering synced audio")
+			renderStarted := time.Now()
+			events.emit("rendering_started", nil)
 			if err := rsync.RenderAudio(ctx, target, targetTrack, drift, ref.Duration, output, rsync.AudioRenderOptions{
 				Codec: f.codec, BitRate: f.bitrate, Channels: f.channels, SampleRate: f.sampleRate,
 				Language: f.language, Overwrite: f.overwrite,
 			}); err != nil {
 				return err
 			}
+			events.emit("rendering_complete", func(e *standaloneEvent) {
+				e.ElapsedMS = int64Ptr(time.Since(renderStarted).Milliseconds())
+				setOutputSize(e, output)
+			})
 			if f.verify {
 				ui.Step("verifying the finished audio")
+				verificationStarted := time.Now()
+				events.emit("verification_started", nil)
 				verification, err = verifyAudioOutput(ctx, ref, refTrack, output, f)
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
 				}
 				reportVerification(verification)
+				events.emit("verification_complete", func(e *standaloneEvent) {
+					setVerificationEventMetrics(e, verification)
+					e.ElapsedMS = int64Ptr(time.Since(verificationStarted).Milliseconds())
+				})
+			}
+			if f.writePlan != "" {
+				plan, err := planFromDrift(reference, targetPath, ref.Duration, target.Duration, drift, verification)
+				if err != nil {
+					return err
+				}
+				if err := writeAlignmentPlan(f.writePlan, plan, f.overwrite); err != nil {
+					return err
+				}
+				ui.Field("alignment plan", f.writePlan)
 			}
 		}
 		language := f.language
@@ -245,12 +328,20 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 			language = targetTrack.Language
 		}
 		results = append(results, standaloneResult{
-			SchemaVersion: 2, Mode: "audio", Reference: reference, Target: targetPath, Output: output,
+			SchemaVersion: 2, Mode: "audio", Reference: reference, Target: targetPath, Output: output, Method: method,
 			Language: language, DryRun: f.dryRun,
 			SyncMS: drift.DelayMS, Scale: drift.Factor(), DriftPPM: (drift.Factor() - 1) * 1_000_000,
 			FPSConversion: timingDescription(drift.Factor()), Score: drift.Score,
 			Samples: drift.Samples, ResidualMS: drift.ResidualMS, Segments: nonNilSegments(drift.Segments),
 			Gaps: nonNilGaps(drift.Gaps), Verification: verification,
+		})
+		events.emit("target_complete", func(e *standaloneEvent) {
+			e.DryRun = boolPtr(f.dryRun)
+			setDriftEventMetrics(e, drift)
+			if verification != nil {
+				e.Passed = boolPtr(verification.Passed)
+			}
+			e.ElapsedMS = int64Ptr(time.Since(targetStarted).Milliseconds())
 		})
 	}
 	if flagJSON {
@@ -265,39 +356,93 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		return fmt.Errorf("reference subtitle: %w", err)
 	}
 	var results []standaloneResult
+	_, referenceEnd := subtitleCueBounds(refCues)
+	var reusablePlan *alignmentPlan
+	if f.alignmentPlan != "" {
+		plan, err := readAlignmentPlan(f.alignmentPlan, "subtitles", reference, referenceEnd)
+		if err != nil {
+			return err
+		}
+		reusablePlan = &plan
+	}
+	var semanticMatcher subtitle.SemanticAnchorMatcher
+	if f.semanticCodexModel != "" {
+		semanticMatcher = &subtitle.CodexAnchorMatcher{
+			Binary: f.semanticCodexBin, Model: f.semanticCodexModel,
+			ReasoningEffort: "low", Timeout: f.semanticCodexTimeout,
+		}
+	}
 	if len(targets) > 1 {
 		ui.Section("subtitle batch")
 		ui.Field("targets", fmt.Sprintf("%d files", len(targets)))
 	}
-	for _, targetPath := range targets {
+	for targetIndex, targetPath := range targets {
+		output := standaloneOutput(targetPath, f, "subtitles")
+		events := newStandaloneEventEmitter(f, "subtitles", reference, targetPath, output, targetIndex+1, len(targets))
+		targetStarted := time.Now()
+		events.emit("target_started", func(e *standaloneEvent) {
+			e.DryRun = boolPtr(f.dryRun)
+		})
 		targetCues, err := subtitle.Read(ctx, targetPath)
 		if err != nil {
 			return fmt.Errorf("target %s: %w", filepath.Base(targetPath), err)
 		}
-		output := standaloneOutput(targetPath, f, "subtitles")
 		ui.Section("subtitle sync")
 		ui.Field("reference", filepath.Base(reference))
 		ui.Field("target", filepath.Base(targetPath))
 		var alignment subtitle.Alignment
-		if shiftSet || factorSet {
-			alignment = subtitle.Alignment{OffsetMS: f.shift, Scale: f.factor, ReferenceCues: len(refCues), TargetCues: len(targetCues)}
+		measurementStarted := time.Now()
+		events.emit("measuring_started", func(e *standaloneEvent) {
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+		})
+		if reusablePlan != nil {
+			ui.Step("applying verified sibling timeline plan")
+			alignment = reusablePlan.subtitleAlignment(len(refCues), len(targetCues))
+		} else if shiftSet || factorSet {
+			alignment = subtitle.Alignment{Method: "manual", OffsetMS: f.shift, Scale: f.factor, ReferenceCues: len(refCues), TargetCues: len(targetCues)}
 		} else {
 			minScore := subtitleMinScore(f.minScore)
 			if f.force {
 				minScore = 0.01
 			}
-			alignment, err = subtitle.Align(refCues, targetCues, subtitle.AlignOptions{
+			alignOpts := subtitle.AlignOptions{
 				MaxOffsetSeconds: f.maxOffset,
 				MinScore:         minScore,
 				MinGapSeconds:    f.minGap,
 				MaxSegments:      f.maxSegments,
 				DisablePiecewise: !f.detectGaps,
-			})
+			}
+			if semanticMatcher != nil {
+				ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
+				events.emit("semantic_ai_started", func(e *standaloneEvent) {
+					e.AI = boolPtr(true)
+					e.Model = f.semanticCodexModel
+				})
+				alignment, err = subtitle.AlignCodexSemantic(ctx, refCues, targetCues, semanticMatcher, subtitle.SemanticOptions{
+					AlignOptions: alignOpts, SearchWindowSeconds: f.semanticWindow,
+				})
+				if err == nil {
+					events.emit("semantic_ai_complete", func(e *standaloneEvent) {
+						e.AI = boolPtr(true)
+						e.Model = f.semanticCodexModel
+						setAlignmentEventMetrics(e, alignment)
+					})
+				}
+			} else {
+				ui.Step("matching language-independent subtitle activity")
+				alignment, err = subtitle.Align(refCues, targetCues, alignOpts)
+			}
 			if err != nil {
 				return fmt.Errorf("align %s: %w", filepath.Base(targetPath), err)
 			}
 		}
+		events.emit("measuring_complete", func(e *standaloneEvent) {
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+			setAlignmentEventMetrics(e, alignment)
+			e.ElapsedMS = int64Ptr(time.Since(measurementStarted).Milliseconds())
+		})
 		ui.Field("sync (ms)", fmt.Sprintf("%+d", alignment.OffsetMS))
+		ui.Field("method", alignment.Method)
 		ui.Field("scale", fmt.Sprintf("%.9f", alignment.Scale))
 		ui.Field("FPS / timing", timingDescription(alignment.Scale))
 		if alignment.Score > 0 {
@@ -307,25 +452,56 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		ui.Field("output", output)
 		var verification *standaloneVerification
 		if !f.dryRun {
+			renderStarted := time.Now()
+			events.emit("rendering_started", nil)
 			synced := subtitle.Apply(targetCues, alignment)
 			if err := subtitle.Write(ctx, output, synced, f.overwrite); err != nil {
 				return err
 			}
+			events.emit("rendering_complete", func(e *standaloneEvent) {
+				e.ElapsedMS = int64Ptr(time.Since(renderStarted).Milliseconds())
+				setOutputSize(e, output)
+			})
 			if f.verify {
 				ui.Step("verifying the finished subtitles")
-				verification, err = verifySubtitleOutput(ctx, refCues, output, f)
+				verificationStarted := time.Now()
+				events.emit("verification_started", nil)
+				verification, err = verifySubtitleOutput(ctx, refCues, output, f, semanticMatcher)
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
 				}
 				reportVerification(verification)
+				events.emit("verification_complete", func(e *standaloneEvent) {
+					setVerificationEventMetrics(e, verification)
+					e.ElapsedMS = int64Ptr(time.Since(verificationStarted).Milliseconds())
+				})
+			}
+			if f.writePlan != "" {
+				_, targetEnd := subtitleCueBounds(targetCues)
+				plan, err := planFromSubtitle(reference, targetPath, referenceEnd, targetEnd, alignment, verification)
+				if err != nil {
+					return err
+				}
+				if err := writeAlignmentPlan(f.writePlan, plan, f.overwrite); err != nil {
+					return err
+				}
+				ui.Field("alignment plan", f.writePlan)
 			}
 		}
 		results = append(results, standaloneResult{
-			SchemaVersion: 2, Mode: "subtitles", Reference: reference, Target: targetPath, Output: output, DryRun: f.dryRun,
+			SchemaVersion: 2, Mode: "subtitles", Reference: reference, Target: targetPath, Output: output, Method: alignment.Method, DryRun: f.dryRun,
 			SyncMS: alignment.OffsetMS, Scale: alignment.Scale, DriftPPM: (alignment.Scale - 1) * 1_000_000,
 			FPSConversion: timingDescription(alignment.Scale), Score: alignment.Score, OriginalScore: alignment.OriginalScore,
 			Samples: alignment.Samples, ResidualMS: alignment.ResidualMS, Segments: nonNilSegments(alignment.Segments),
 			Gaps: nonNilGaps(alignment.Gaps), Verification: verification,
+		})
+		events.emit("target_complete", func(e *standaloneEvent) {
+			e.DryRun = boolPtr(f.dryRun)
+			setAlignmentEventMetrics(e, alignment)
+			if verification != nil {
+				e.Passed = boolPtr(verification.Passed)
+			}
+			e.ElapsedMS = int64Ptr(time.Since(targetStarted).Milliseconds())
 		})
 	}
 	if flagJSON {
@@ -362,15 +538,27 @@ func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track
 	}, nil
 }
 
-func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output string, f *standaloneFlags) (*standaloneVerification, error) {
+func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output string, f *standaloneFlags, semanticMatcher subtitle.SemanticAnchorMatcher) (*standaloneVerification, error) {
 	finished, err := subtitle.Read(ctx, output)
 	if err != nil {
 		return nil, err
 	}
-	a, err := subtitle.Align(reference, finished, subtitle.AlignOptions{
+	alignOpts := subtitle.AlignOptions{
 		MaxOffsetSeconds: math.Min(f.maxOffset, 30), MinScore: subtitleMinScore(f.minScore),
 		MinGapSeconds: f.minGap, MaxSegments: f.maxSegments,
-	})
+	}
+	var a subtitle.Alignment
+	if semanticMatcher != nil {
+		window := f.semanticWindow
+		if window <= 0 || window > 30 {
+			window = 30
+		}
+		a, err = subtitle.AlignCodexSemantic(ctx, reference, finished, semanticMatcher, subtitle.SemanticOptions{
+			AlignOptions: alignOpts, SearchWindowSeconds: window,
+		})
+	} else {
+		a, err = subtitle.Align(reference, finished, alignOpts)
+	}
 	if err != nil {
 		return nil, err
 	}
