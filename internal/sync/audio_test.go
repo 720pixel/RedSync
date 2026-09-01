@@ -82,6 +82,44 @@ func TestInitialAudioMatchRetriesKnownFPSScale(t *testing.T) {
 	}
 }
 
+func TestMeasureAudioContinuesPastWeakHeadSeedForFPSMismatch(t *testing.T) {
+	originalDecode, originalFind := offsetDecode, offsetFindScaled
+	defer func() {
+		offsetDecode, offsetFindScaled = originalDecode, originalFind
+	}()
+	offsetDecode = func(_ context.Context, _ string, _ int, _, duration float64) ([]float64, error) {
+		return make([]float64, int(math.Round(duration*10))), nil
+	}
+	const expectedScale = 0.99896
+	offsetFindScaled = func(a, b []float64, scale float64) (offset.Result, error) {
+		// The initial 155-second head probe is deliberately marginal at every
+		// candidate speed. Shorter full-runtime probes are strong only when the
+		// 23.976 -> 24 timing correction is applied.
+		if len(a) > 1000 || len(b) > 1000 {
+			return offset.Result{Score: 3.92}, nil
+		}
+		if math.Abs(scale-expectedScale) < 0.0002 {
+			return offset.Result{Score: 8.1}, nil
+		}
+		return offset.Result{Score: 3.1}, nil
+	}
+
+	ref := media.File{Path: "reference", Duration: 7133.760, Audio: []media.Track{{Index: 0, Kind: media.Audio}}}
+	target := media.File{Path: "target", Duration: 7141.184, Audio: []media.Track{{Index: 0, Kind: media.Audio}}}
+	drift, err := MeasureAudio(context.Background(), ref, target, 0, 0, MeasureOptions{
+		MinScore: 4, DisablePiecewise: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drift.Score < 4 || drift.Samples < 4 {
+		t.Fatalf("full-runtime evidence was not enforced: score=%.2f samples=%d", drift.Score, drift.Samples)
+	}
+	if math.Abs(drift.Factor()-expectedScale) > 0.0002 {
+		t.Fatalf("scale = %.9f, want near %.9f", drift.Factor(), expectedScale)
+	}
+}
+
 func TestRefineAudioBoundarySearchesOriginalBracket(t *testing.T) {
 	originalDecode, originalFind := offsetDecode, offsetFindScaled
 	defer func() {

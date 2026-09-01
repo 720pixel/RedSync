@@ -98,8 +98,16 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	if err != nil {
 		return Drift{}, fmt.Errorf("initial audio match: %w", err)
 	}
-	if initialScore < minScore {
-		return Drift{}, fmt.Errorf("audio match confidence is too low (%.2f < %.2f); files may not contain the same programme", initialScore, minScore)
+	// The broad head probe is only a seed for the full-runtime search. Dubbed
+	// features can fall just below the strict acceptance score here when their
+	// source clock is 23.976 rather than 24 fps (or when a distributor bumper /
+	// black-silence edge differs), even though dense scaled probes agree strongly
+	// across the rest of the programme. Keep a small floor to reject a completely
+	// unrelated seed, then enforce minScore on every candidate and dense anchor
+	// below. This does not relax final acceptance.
+	seedFloor := math.Min(minScore, 0.5)
+	if initialScore < seedFloor {
+		return Drift{}, fmt.Errorf("audio seed confidence is too low (%.2f < %.2f); files may not contain the same programme", initialScore, seedFloor)
 	}
 	initialSec := float64(initial) / 1000
 	initialCenter := initialWin / 2
@@ -178,6 +186,9 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 		MinJumpSeconds: opts.MinGapSeconds,
 		MaxSegments:    maxSegments,
 	})
+	if fit.Score < minScore {
+		return Drift{}, fmt.Errorf("full-runtime audio confidence is too low (%.2f < %.2f)", fit.Score, minScore)
+	}
 	scale := fit.Scale
 	if scale < 0.8 || scale > 1.2 {
 		return Drift{}, fmt.Errorf("implausible audio speed factor %.6f", scale)
