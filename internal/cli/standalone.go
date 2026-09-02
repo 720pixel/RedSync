@@ -159,8 +159,8 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	if f.alignmentPlan != "" && (shiftSet || factorSet || f.semanticCodexModel != "" || f.writePlan != "") {
 		return fmt.Errorf("--alignment-plan cannot be combined with manual shift/factor, --semantic-codex-model, or --write-alignment-plan")
 	}
-	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet || f.semanticCodexModel != "" || f.verificationReference != "") {
-		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan, manual shift/factor, semantic matching, or --verification-reference")
+	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet || f.verificationReference != "") {
+		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan, manual shift/factor, or --verification-reference")
 	}
 	if f.verificationReference != "" && f.alignmentPlan == "" {
 		return fmt.Errorf("--verification-reference requires --alignment-plan")
@@ -442,15 +442,29 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 			alignment = reusablePlan.subtitleAlignment(len(refCues), len(targetCues))
 		} else if sourceTimelinePlan != nil {
 			ui.Step("applying verified source audio timeline and fitting subtitle residual")
-			alignment, err = subtitleAlignmentFromSourceTimeline(refCues, targetCues, *sourceTimelinePlan, subtitle.AlignOptions{
+			if semanticMatcher != nil {
+				ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
+				events.emit("semantic_ai_started", func(e *standaloneEvent) {
+					e.AI = boolPtr(true)
+					e.Model = f.semanticCodexModel
+				})
+			}
+			alignment, err = subtitleAlignmentFromSourceTimeline(ctx, refCues, targetCues, *sourceTimelinePlan, subtitle.AlignOptions{
 				MaxOffsetSeconds: math.Min(f.maxOffset, 30),
 				MinScore:         subtitleMinScore(f.minScore),
 				MinGapSeconds:    f.minGap,
 				MaxSegments:      f.maxSegments,
 				DisablePiecewise: true,
-			})
+			}, semanticMatcher, f.semanticWindow)
 			if err != nil {
 				return fmt.Errorf("apply source timeline to %s: %w", filepath.Base(targetPath), err)
+			}
+			if semanticMatcher != nil {
+				events.emit("semantic_ai_complete", func(e *standaloneEvent) {
+					e.AI = boolPtr(true)
+					e.Model = f.semanticCodexModel
+					setAlignmentEventMetrics(e, alignment)
+				})
 			}
 		} else if shiftSet || factorSet {
 			alignment = subtitle.Alignment{Method: "manual", OffsetMS: f.shift, Scale: f.factor, ReferenceCues: len(refCues), TargetCues: len(targetCues)}
@@ -528,7 +542,11 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 					// every cue, timestamp and line must survive exactly as transformed.
 					verification, err = verifyPlannedSubtitleOutput(ctx, synced, output)
 				} else {
-					verification, err = verifySubtitleOutput(ctx, refCues, output, f, semanticMatcher)
+					verificationMatcher := semanticMatcher
+					if alignment.Method == "source_timeline_plan_cross_language_activity" {
+						verificationMatcher = nil
+					}
+					verification, err = verifySubtitleOutput(ctx, refCues, output, f, verificationMatcher)
 				}
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
@@ -573,7 +591,7 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 	return nil
 }
 
-func subtitleAlignmentFromSourceTimeline(reference, target []subtitle.Cue, plan alignmentPlan, opts subtitle.AlignOptions) (subtitle.Alignment, error) {
+func subtitleAlignmentFromSourceTimeline(ctx context.Context, reference, target []subtitle.Cue, plan alignmentPlan, opts subtitle.AlignOptions, semanticMatcher subtitle.SemanticAnchorMatcher, semanticWindow float64) (subtitle.Alignment, error) {
 	if len(reference) < 3 || len(target) < 3 {
 		return subtitle.Alignment{}, fmt.Errorf("need at least 3 cues in both reference and target")
 	}
@@ -585,16 +603,48 @@ func subtitleAlignmentFromSourceTimeline(reference, target []subtitle.Cue, plan 
 
 	base := plan.subtitleAlignment(len(reference), len(target))
 	provisional := subtitle.Apply(target, base)
-	residual, err := subtitle.Align(reference, provisional, opts)
+	activityResidual, activityErr := subtitle.Align(reference, provisional, opts)
+	residual, err := activityResidual, activityErr
+	method := "source_timeline_plan"
+	if semanticMatcher != nil {
+		if semanticWindow <= 0 || semanticWindow > 30 {
+			semanticWindow = 30
+		}
+		semanticResidual, semanticErr := subtitle.AlignCodexSemantic(ctx, reference, provisional, semanticMatcher, subtitle.SemanticOptions{
+			AlignOptions: opts, SearchWindowSeconds: semanticWindow,
+		})
+		semanticSafe := semanticErr == nil && len(semanticResidual.Gaps) == 0 && math.Abs((semanticResidual.Scale-1)*1_000_000) <= 50 && semanticResidual.ResidualMS <= 350 && absInt(semanticResidual.OffsetMS) <= 30_000
+		activitySafe := activityErr == nil && len(activityResidual.Gaps) == 0 && math.Abs((activityResidual.Scale-1)*1_000_000) <= 50 && activityResidual.ResidualMS <= 250 && absInt(activityResidual.OffsetMS) <= 30_000
+		switch {
+		case semanticSafe && (!activitySafe || semanticResidual.ResidualMS <= activityResidual.ResidualMS):
+			residual, err = semanticResidual, nil
+			method = "source_timeline_plan_semantic"
+		case activitySafe:
+			residual, err = activityResidual, nil
+			method = "source_timeline_plan_cross_language_activity"
+		case semanticErr != nil:
+			return subtitle.Alignment{}, fmt.Errorf("fit semantic subtitle residual: %w; deterministic activity fallback: %v", semanticErr, activityErr)
+		default:
+			residual, err = semanticResidual, nil
+			method = "source_timeline_plan_semantic"
+		}
+	}
 	if err != nil {
 		return subtitle.Alignment{}, fmt.Errorf("fit subtitle residual: %w", err)
 	}
 	ppm := (residual.Scale - 1) * 1_000_000
-	if len(residual.Gaps) != 0 || math.Abs(ppm) > 50 || residual.ResidualMS > 100 || absInt(residual.OffsetMS) > 30_000 {
+	maxResidualMS := 100
+	if semanticMatcher != nil {
+		// Translations legitimately split and merge dialogue at slightly
+		// different points. The verified audio plan already fixes the edit
+		// topology, so semantic evidence only fits one bounded residual.
+		maxResidualMS = 350
+	}
+	if len(residual.Gaps) != 0 || math.Abs(ppm) > 50 || residual.ResidualMS > maxResidualMS || absInt(residual.OffsetMS) > 30_000 {
 		return subtitle.Alignment{}, fmt.Errorf("source timeline left unsafe subtitle residual (%+dms, %+.0f ppm, %dms residual, %d gaps)", residual.OffsetMS, ppm, residual.ResidualMS, len(residual.Gaps))
 	}
 
-	base.Method = "source_timeline_plan"
+	base.Method = method
 	base.OffsetMS += residual.OffsetMS
 	base.Score = residual.Score
 	base.OriginalScore = residual.OriginalScore
@@ -668,8 +718,14 @@ func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output 
 	_, referenceEnd := subtitleCueBounds(reference)
 	_, outputEnd := subtitleCueBounds(finished)
 	durationDelta := int(math.Round((outputEnd - referenceEnd) * 1000))
+	maxResidualMS := 100
+	if semanticMatcher != nil {
+		maxResidualMS = 350
+	} else if f.sourceTimelinePlan != "" && f.semanticCodexModel != "" {
+		maxResidualMS = 250
+	}
 	return &standaloneVerification{
-		Passed: absInt(a.OffsetMS) <= 80 && math.Abs(ppm) <= 50 && a.ResidualMS <= 100 && len(a.Gaps) == 0,
+		Passed: absInt(a.OffsetMS) <= 80 && math.Abs(ppm) <= 50 && a.ResidualMS <= maxResidualMS && len(a.Gaps) == 0,
 		SyncMS: a.OffsetMS, Scale: a.Scale, DriftPPM: ppm,
 		FPSConversion: timingDescription(a.Scale), Score: a.Score,
 		Samples: a.Samples, ResidualMS: a.ResidualMS,

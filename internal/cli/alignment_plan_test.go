@@ -12,6 +12,28 @@ import (
 	"github.com/720pixel/RedSync/internal/timeline"
 )
 
+type identitySemanticMatcher struct{}
+
+func (identitySemanticMatcher) Match(_ context.Context, reference, target []subtitle.Cue, _ subtitle.Alignment, _ subtitle.SemanticOptions) ([]subtitle.SemanticAnchorPair, error) {
+	count := min(len(reference), len(target))
+	pairs := make([]subtitle.SemanticAnchorPair, count)
+	for i := range pairs {
+		pairs[i] = subtitle.SemanticAnchorPair{ReferenceFirst: i, ReferenceLast: i, TargetFirst: i, TargetLast: i}
+	}
+	return pairs, nil
+}
+
+type shiftedSemanticMatcher struct{}
+
+func (shiftedSemanticMatcher) Match(_ context.Context, reference, target []subtitle.Cue, _ subtitle.Alignment, _ subtitle.SemanticOptions) ([]subtitle.SemanticAnchorPair, error) {
+	count := min(len(reference), len(target)) - 1
+	pairs := make([]subtitle.SemanticAnchorPair, count)
+	for i := range pairs {
+		pairs[i] = subtitle.SemanticAnchorPair{ReferenceFirst: i, ReferenceLast: i, TargetFirst: i + 1, TargetLast: i + 1}
+	}
+	return pairs, nil
+}
+
 func TestSiblingVerificationReferenceRequiresVerifiedPlanRendering(t *testing.T) {
 	tests := []struct {
 		name string
@@ -230,9 +252,9 @@ func TestSourceTimelineSubtitleAlignmentAddsVerifiedResidual(t *testing.T) {
 	}
 	reference := subtitle.Apply(target, wantAlignment)
 
-	got, err := subtitleAlignmentFromSourceTimeline(reference, target, plan, subtitle.AlignOptions{
+	got, err := subtitleAlignmentFromSourceTimeline(context.Background(), reference, target, plan, subtitle.AlignOptions{
 		MaxOffsetSeconds: 30, MinScore: 0.1, MinGapSeconds: 0.35, MaxSegments: 8,
-	})
+	}, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +263,26 @@ func TestSourceTimelineSubtitleAlignmentAddsVerifiedResidual(t *testing.T) {
 	}
 	if rendered := subtitle.Apply(target, got); len(rendered) != len(reference) || rendered[0].Start != reference[0].Start || rendered[len(rendered)-1].End != reference[len(reference)-1].End {
 		t.Fatalf("source timeline render differs from reference: got=%+v want=%+v", rendered, reference)
+	}
+
+	semanticGot, err := subtitleAlignmentFromSourceTimeline(context.Background(), reference, target, plan, subtitle.AlignOptions{
+		MaxOffsetSeconds: 30, MinScore: 0.1, MinGapSeconds: 0.35, MaxSegments: 8,
+	}, identitySemanticMatcher{}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if semanticGot.Method != "source_timeline_plan_semantic" || semanticGot.OffsetMS != got.OffsetMS {
+		t.Fatalf("semantic source timeline residual not preserved: %+v", semanticGot)
+	}
+
+	fallbackGot, err := subtitleAlignmentFromSourceTimeline(context.Background(), reference, target, plan, subtitle.AlignOptions{
+		MaxOffsetSeconds: 30, MinScore: 0.1, MinGapSeconds: 0.35, MaxSegments: 8,
+	}, shiftedSemanticMatcher{}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallbackGot.Method != "source_timeline_plan_cross_language_activity" || fallbackGot.OffsetMS != got.OffsetMS {
+		t.Fatalf("unsafe semantic result did not fall back to tighter activity alignment: %+v", fallbackGot)
 	}
 }
 

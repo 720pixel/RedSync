@@ -417,7 +417,11 @@ RedSync sync cc-english-sdh.vtt source-english-sdh.vtt \
 `--source-timeline-plan` accepts only a verified audio plan. RedSync applies
 its piecewise source edits, fits only one bounded subtitle residual offset,
 and independently verifies the rendered subtitle against the exact subtitle
-reference before writing the subtitle plan.
+reference before writing the subtitle plan. If that reference is translated,
+`--semantic-codex-model` may be combined with the source timeline. RedSync
+compares the semantic residual with deterministic cue activity and uses only
+the tighter safe fit; semantic evidence cannot replace or alter the verified
+audio edit/gap topology.
 
 Plan reuse skips measurement but not rendering or final verification. Before
 rendering, RedSync rejects unknown schema fields, an unverified plan, media-type

@@ -30,12 +30,15 @@ Update this snapshot when alignment architecture or CLI contracts change.
   black intervals. It applies a verified audio plan to the same source's
   English subtitle anchor, fits one bounded residual subtitle offset, performs
   normal exact-reference subtitle verification, and can export the resulting
-  subtitle plan for translated siblings.
+  subtitle plan for translated siblings. When the exact reference is
+  translated, semantic matching is allowed only for that residual; its result
+  is compared with deterministic cue activity and the tighter safe fit wins.
 
-## Extreme subtitle-only fallback
+## Cross-language fallback
 
-- Semantic matching is used only when no audio and no target-English subtitle
-  anchor exist. `CodexAnchorMatcher` samples distinctive reference dialogue and
+- Semantic matching is used when no target-English subtitle reference exists,
+  either with a verified source-audio timeline or in the extreme subtitle-only
+  case. `CodexAnchorMatcher` samples distinctive reference dialogue and
   nearby one/two-cue target candidates, then asks a short-lived Codex CLI
   process for sparse meaning-equivalent pairs. It never asks AI to calculate
   timings or translate the complete subtitle.
