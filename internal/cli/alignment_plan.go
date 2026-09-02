@@ -50,6 +50,27 @@ type verificationGate struct {
 }
 
 func readAlignmentPlan(path, mode, referencePath string, referenceDuration float64) (alignmentPlan, error) {
+	plan, err := decodeAlignmentPlan(path)
+	if err != nil {
+		return alignmentPlan{}, err
+	}
+	if err := validateAlignmentPlan(plan, mode); err != nil {
+		return alignmentPlan{}, err
+	}
+	if !sameDuration(plan.ReferenceDurationSeconds, referenceDuration) {
+		return alignmentPlan{}, fmt.Errorf("alignment plan reference duration %.3fs does not match current reference %.3fs", plan.ReferenceDurationSeconds, referenceDuration)
+	}
+	digest, err := fileSHA256(referencePath)
+	if err != nil {
+		return alignmentPlan{}, fmt.Errorf("hash alignment-plan reference: %w", err)
+	}
+	if !strings.EqualFold(plan.ReferenceSHA256, digest) {
+		return alignmentPlan{}, fmt.Errorf("alignment plan reference SHA-256 does not match %s", filepath.Base(referencePath))
+	}
+	return plan, nil
+}
+
+func decodeAlignmentPlan(path string) (alignmentPlan, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return alignmentPlan{}, fmt.Errorf("read alignment plan: %w", err)
@@ -67,18 +88,23 @@ func readAlignmentPlan(path, mode, referencePath string, referenceDuration float
 		}
 		return alignmentPlan{}, fmt.Errorf("decode alignment plan trailing data: %w", err)
 	}
-	if err := validateAlignmentPlan(plan, mode); err != nil {
+	return plan, nil
+}
+
+// readSourceTimelinePlan loads a verified audio plan for use as timing evidence
+// when an English subtitle anchor comes from the same source container. The
+// plan stays bound to its original audio reference; the subtitle path performs
+// a fresh residual fit and full verification against its own exact reference.
+func readSourceTimelinePlan(path string) (alignmentPlan, error) {
+	plan, err := decodeAlignmentPlan(path)
+	if err != nil {
 		return alignmentPlan{}, err
 	}
-	if !sameDuration(plan.ReferenceDurationSeconds, referenceDuration) {
-		return alignmentPlan{}, fmt.Errorf("alignment plan reference duration %.3fs does not match current reference %.3fs", plan.ReferenceDurationSeconds, referenceDuration)
+	if err := validateAlignmentPlan(plan, "audio"); err != nil {
+		return alignmentPlan{}, fmt.Errorf("source timeline plan: %w", err)
 	}
-	digest, err := fileSHA256(referencePath)
-	if err != nil {
-		return alignmentPlan{}, fmt.Errorf("hash alignment-plan reference: %w", err)
-	}
-	if !strings.EqualFold(plan.ReferenceSHA256, digest) {
-		return alignmentPlan{}, fmt.Errorf("alignment plan reference SHA-256 does not match %s", filepath.Base(referencePath))
+	if len(plan.Segments) == 0 {
+		return alignmentPlan{}, fmt.Errorf("source timeline plan has no piecewise timeline")
 	}
 	return plan, nil
 }

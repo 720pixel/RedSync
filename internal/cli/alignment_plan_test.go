@@ -204,3 +204,54 @@ func TestAlignmentPlanRequiresSameSourceDurationForAudioSiblings(t *testing.T) {
 		t.Fatal("different source cut should be rejected")
 	}
 }
+
+func TestSourceTimelineSubtitleAlignmentAddsVerifiedResidual(t *testing.T) {
+	plan, _ := validTestAlignmentPlan(t)
+	target := []subtitle.Cue{
+		{Start: 10 * time.Second, End: 11 * time.Second, Text: []string{"one"}},
+		{Start: 19 * time.Second, End: 21 * time.Second, Text: []string{"two"}},
+		{Start: 37 * time.Second, End: 39 * time.Second, Text: []string{"three"}},
+		{Start: 55 * time.Second, End: 57 * time.Second, Text: []string{"four"}},
+		{Start: 65 * time.Second, End: 67 * time.Second, Text: []string{"five"}},
+		{Start: 78 * time.Second, End: 81 * time.Second, Text: []string{"six"}},
+		{Start: 96 * time.Second, End: 98 * time.Second, Text: []string{"seven"}},
+		{Start: 115 * time.Second, End: 117 * time.Second, Text: []string{"eight"}},
+	}
+	wantAlignment := plan.subtitleAlignment(len(target), len(target))
+	wantAlignment.OffsetMS += 300
+	for i := range wantAlignment.Segments {
+		wantAlignment.Segments[i].OffsetMS += 300
+		wantAlignment.Segments[i].ReferenceStartMS += 300
+		wantAlignment.Segments[i].ReferenceEndMS += 300
+	}
+	for i := range wantAlignment.Gaps {
+		wantAlignment.Gaps[i].ReferenceBeforeMS += 300
+		wantAlignment.Gaps[i].ReferenceAfterMS += 300
+	}
+	reference := subtitle.Apply(target, wantAlignment)
+
+	got, err := subtitleAlignmentFromSourceTimeline(reference, target, plan, subtitle.AlignOptions{
+		MaxOffsetSeconds: 30, MinScore: 0.1, MinGapSeconds: 0.35, MaxSegments: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Method != "source_timeline_plan" || got.OffsetMS != plan.SyncMS+300 || len(got.Gaps) != len(plan.Gaps) {
+		t.Fatalf("source timeline residual not preserved: %+v", got)
+	}
+	if rendered := subtitle.Apply(target, got); len(rendered) != len(reference) || rendered[0].Start != reference[0].Start || rendered[len(rendered)-1].End != reference[len(reference)-1].End {
+		t.Fatalf("source timeline render differs from reference: got=%+v want=%+v", rendered, reference)
+	}
+}
+
+func TestReadSourceTimelinePlanRejectsSubtitlePlan(t *testing.T) {
+	plan, _ := validTestAlignmentPlan(t)
+	plan.Mode = "subtitles"
+	path := filepath.Join(t.TempDir(), "subtitle-plan.json")
+	if err := writeAlignmentPlan(path, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSourceTimelinePlan(path); err == nil || !strings.Contains(err.Error(), "cannot be used for audio") {
+		t.Fatalf("subtitle source timeline accepted: %v", err)
+	}
+}

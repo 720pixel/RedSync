@@ -26,6 +26,11 @@ Update this snapshot when alignment architecture or CLI contracts change.
   affine bounds, and gaps before rendering. This is the normal multilingual
   CinemaCity path: measure target English once, then make Hindi/Tamil/Telugu
   and other siblings follow English exactly.
+- `--source-timeline-plan` handles mixed audio/subtitle sources with internal
+  black intervals. It applies a verified audio plan to the same source's
+  English subtitle anchor, fits one bounded residual subtitle offset, performs
+  normal exact-reference subtitle verification, and can export the resulting
+  subtitle plan for translated siblings.
 
 ## Extreme subtitle-only fallback
 

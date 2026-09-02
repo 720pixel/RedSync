@@ -403,6 +403,22 @@ RedSync sync cc-english.m4a source-tamil.mka source-telugu.mka \
   --alignment-plan source-s01e01.timeline.json --out-dir synced/
 ```
 
+When a source has internal black intervals, subtitle cue activity alone can
+misidentify those edits. Reuse the already verified audio timeline for the
+source's English subtitle anchor, then export a normal subtitle plan for its
+translated siblings:
+
+```bash
+RedSync sync cc-english-sdh.vtt source-english-sdh.vtt \
+  --source-timeline-plan source-s01e01.timeline.json \
+  --write-alignment-plan source-s01e01.subtitles.json
+```
+
+`--source-timeline-plan` accepts only a verified audio plan. RedSync applies
+its piecewise source edits, fits only one bounded subtitle residual offset,
+and independently verifies the rendered subtitle against the exact subtitle
+reference before writing the subtitle plan.
+
 Plan reuse skips measurement but not rendering or final verification. Before
 rendering, RedSync rejects unknown schema fields, an unverified plan, media-type
 mismatch, a different reference digest/duration, unsafe scale, overlapping or

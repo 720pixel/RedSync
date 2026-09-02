@@ -46,6 +46,7 @@ type standaloneFlags struct {
 	semanticCodexTimeout  time.Duration
 	semanticWindow        float64
 	alignmentPlan         string
+	sourceTimelinePlan    string
 	verificationReference string
 	writePlan             string
 	eventsJSON            bool
@@ -135,6 +136,7 @@ through FFmpeg; subtitles are aligned from language-independent cue activity.`,
 	fl.DurationVar(&f.semanticCodexTimeout, "semantic-codex-timeout", 45*time.Second, "maximum time for sparse Codex semantic matching")
 	fl.Float64Var(&f.semanticWindow, "semantic-window", 0, "semantic candidate window in seconds (default: max of 120 and --max-offset)")
 	fl.StringVar(&f.alignmentPlan, "alignment-plan", "", "reuse a verified local timeline plan instead of measuring this target")
+	fl.StringVar(&f.sourceTimelinePlan, "source-timeline-plan", "", "use a verified audio timeline from the same source container to solve subtitle gaps")
 	fl.StringVar(&f.verificationReference, "verification-reference", "", "verify a planned audio sibling against the rendered anchor instead of the original reference")
 	fl.StringVar(&f.writePlan, "write-alignment-plan", "", "write the verified single-target timeline to a local JSON plan")
 	fl.BoolVar(&f.eventsJSON, "events-json", false, "emit prefixed one-line JSON progress events on stderr")
@@ -156,6 +158,9 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	}
 	if f.alignmentPlan != "" && (shiftSet || factorSet || f.semanticCodexModel != "" || f.writePlan != "") {
 		return fmt.Errorf("--alignment-plan cannot be combined with manual shift/factor, --semantic-codex-model, or --write-alignment-plan")
+	}
+	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet || f.semanticCodexModel != "" || f.verificationReference != "") {
+		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan, manual shift/factor, semantic matching, or --verification-reference")
 	}
 	if f.verificationReference != "" && f.alignmentPlan == "" {
 		return fmt.Errorf("--verification-reference requires --alignment-plan")
@@ -198,6 +203,9 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 			return fmt.Errorf("--verification-reference is only valid for audio")
 		}
 		return syncSubtitleTargets(ctx, reference, targets, f, shiftSet, factorSet)
+	}
+	if f.sourceTimelinePlan != "" {
+		return fmt.Errorf("--source-timeline-plan is only valid for subtitles")
 	}
 	return syncAudioTargets(ctx, reference, targets, f, shiftSet, factorSet)
 }
@@ -391,6 +399,14 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		}
 		reusablePlan = &plan
 	}
+	var sourceTimelinePlan *alignmentPlan
+	if f.sourceTimelinePlan != "" {
+		plan, err := readSourceTimelinePlan(f.sourceTimelinePlan)
+		if err != nil {
+			return err
+		}
+		sourceTimelinePlan = &plan
+	}
 	var semanticMatcher subtitle.SemanticAnchorMatcher
 	if f.semanticCodexModel != "" {
 		semanticMatcher = &subtitle.CodexAnchorMatcher{
@@ -419,11 +435,23 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		var alignment subtitle.Alignment
 		measurementStarted := time.Now()
 		events.emit("measuring_started", func(e *standaloneEvent) {
-			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil && sourceTimelinePlan == nil)
 		})
 		if reusablePlan != nil {
 			ui.Step("applying verified sibling timeline plan")
 			alignment = reusablePlan.subtitleAlignment(len(refCues), len(targetCues))
+		} else if sourceTimelinePlan != nil {
+			ui.Step("applying verified source audio timeline and fitting subtitle residual")
+			alignment, err = subtitleAlignmentFromSourceTimeline(refCues, targetCues, *sourceTimelinePlan, subtitle.AlignOptions{
+				MaxOffsetSeconds: math.Min(f.maxOffset, 30),
+				MinScore:         subtitleMinScore(f.minScore),
+				MinGapSeconds:    f.minGap,
+				MaxSegments:      f.maxSegments,
+				DisablePiecewise: true,
+			})
+			if err != nil {
+				return fmt.Errorf("apply source timeline to %s: %w", filepath.Base(targetPath), err)
+			}
 		} else if shiftSet || factorSet {
 			alignment = subtitle.Alignment{Method: "manual", OffsetMS: f.shift, Scale: f.factor, ReferenceCues: len(refCues), TargetCues: len(targetCues)}
 		} else {
@@ -463,7 +491,7 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 			}
 		}
 		events.emit("measuring_complete", func(e *standaloneEvent) {
-			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
+			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil && sourceTimelinePlan == nil)
 			setAlignmentEventMetrics(e, alignment)
 			e.ElapsedMS = int64Ptr(time.Since(measurementStarted).Milliseconds())
 		})
@@ -543,6 +571,45 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		return emitJSON(results)
 	}
 	return nil
+}
+
+func subtitleAlignmentFromSourceTimeline(reference, target []subtitle.Cue, plan alignmentPlan, opts subtitle.AlignOptions) (subtitle.Alignment, error) {
+	if len(reference) < 3 || len(target) < 3 {
+		return subtitle.Alignment{}, fmt.Errorf("need at least 3 cues in both reference and target")
+	}
+	_, targetEnd := subtitleCueBounds(target)
+	coverageEnd := float64(plan.Segments[len(plan.Segments)-1].TargetEndMS) / 1000
+	if targetEnd > coverageEnd+2 {
+		return subtitle.Alignment{}, fmt.Errorf("subtitle ends at %.3fs beyond source timeline coverage %.3fs", targetEnd, coverageEnd)
+	}
+
+	base := plan.subtitleAlignment(len(reference), len(target))
+	provisional := subtitle.Apply(target, base)
+	residual, err := subtitle.Align(reference, provisional, opts)
+	if err != nil {
+		return subtitle.Alignment{}, fmt.Errorf("fit subtitle residual: %w", err)
+	}
+	ppm := (residual.Scale - 1) * 1_000_000
+	if len(residual.Gaps) != 0 || math.Abs(ppm) > 50 || residual.ResidualMS > 100 || absInt(residual.OffsetMS) > 30_000 {
+		return subtitle.Alignment{}, fmt.Errorf("source timeline left unsafe subtitle residual (%+dms, %+.0f ppm, %dms residual, %d gaps)", residual.OffsetMS, ppm, residual.ResidualMS, len(residual.Gaps))
+	}
+
+	base.Method = "source_timeline_plan"
+	base.OffsetMS += residual.OffsetMS
+	base.Score = residual.Score
+	base.OriginalScore = residual.OriginalScore
+	base.Samples = residual.Samples
+	base.ResidualMS = residual.ResidualMS
+	for i := range base.Segments {
+		base.Segments[i].OffsetMS += residual.OffsetMS
+		base.Segments[i].ReferenceStartMS += residual.OffsetMS
+		base.Segments[i].ReferenceEndMS += residual.OffsetMS
+	}
+	for i := range base.Gaps {
+		base.Gaps[i].ReferenceBeforeMS += residual.OffsetMS
+		base.Gaps[i].ReferenceAfterMS += residual.OffsetMS
+	}
+	return base, nil
 }
 
 func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track, output string, f *standaloneFlags) (*standaloneVerification, error) {
