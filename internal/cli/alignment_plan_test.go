@@ -193,6 +193,21 @@ func TestAlignmentPlanRejectsUnverifiedAndWrongReference(t *testing.T) {
 	}
 }
 
+func TestAlignmentPlanExportDoesNotMaskFailedVerification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "must-not-exist.json")
+	built := false
+	exported, err := exportVerifiedAlignmentPlan(path, false, &standaloneVerification{Passed: false}, func() (alignmentPlan, error) {
+		built = true
+		return alignmentPlan{}, nil
+	})
+	if err != nil || exported || built {
+		t.Fatalf("failed verification reached plan export: exported=%v built=%v err=%v", exported, built, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("failed verification created a plan: %v", err)
+	}
+}
+
 func TestAlignmentPlanRejectsNonMonotonicSegments(t *testing.T) {
 	plan, _ := validTestAlignmentPlan(t)
 	plan.Segments[1].TargetStartMS = 59_000
