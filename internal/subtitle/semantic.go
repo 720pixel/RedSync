@@ -163,6 +163,7 @@ func AlignSemantic(ctx context.Context, reference, target []Cue, embedder Embedd
 		fit = timeline.Piecewise(clean, targetLast, timeline.Options{MinJumpSeconds: opts.MinGapSeconds, MaxSegments: 1, MinAnchors: 3})
 	}
 	refineSemanticBoundaries(&fit, clean)
+	protectSemanticGapCues(reference, target, &fit)
 	if fit.ResidualMS > 1500 {
 		return Alignment{}, fmt.Errorf("semantic subtitle timing residual is too high (%dms > 1500ms)", fit.ResidualMS)
 	}
@@ -171,9 +172,115 @@ func AlignSemantic(ctx context.Context, reference, target []Cue, embedder Embedd
 		OffsetMS: fit.OffsetMS, Scale: fit.Scale, Score: medianSimilarity,
 		OriginalScore: seed.OriginalScore, ReferenceCues: len(reference), TargetCues: len(target),
 		Samples: fit.Samples, ResidualMS: fit.ResidualMS, Segments: fit.Segments, Gaps: fit.Gaps,
-		Method: "semantic",
+		Method: "semantic", PreserveTargetCues: true,
 	}
 	return alignment, nil
+}
+
+// protectSemanticGapCues keeps a sparse semantic boundary from deleting
+// dialogue that already has strong temporal support on either side of the
+// proposed cut. Cross-language cue splitting makes the exact edit boundary
+// much noisier than the surrounding semantic anchors; the timeline jump can
+// still be correct while its midpoint lands on a legitimate short cue.
+func protectSemanticGapCues(reference, target []Cue, fit *timeline.Fit) {
+	if fit == nil || len(reference) == 0 || len(target) == 0 {
+		return
+	}
+	for gapIndex := range fit.Gaps {
+		gap := fit.Gaps[gapIndex]
+		if gap.DeltaMS >= 0 || gapIndex+1 >= len(fit.Segments) {
+			continue
+		}
+		left, right := fit.Segments[gapIndex], fit.Segments[gapIndex+1]
+		scale := right.Scale
+		if scale <= 0 {
+			scale = 1
+		}
+		durationSeconds := float64(gap.DurationMS) / 1000 / scale
+		original := float64(gap.TargetAtMS) / 1000
+		candidate := original
+		maxMove := math.Max(5, math.Min(30, durationSeconds*4))
+		for attempt := 0; attempt < 4; attempt++ {
+			lower, upper := math.Inf(-1), math.Inf(1)
+			for _, cue := range target {
+				mid := float64(cue.Start+cue.End) / 2 / float64(time.Second)
+				if mid < candidate || mid >= candidate+durationSeconds {
+					continue
+				}
+				leftSupport := semanticCueTemporalSupport(reference, cue, left)
+				rightSupport := semanticCueTemporalSupport(reference, cue, right)
+				if leftSupport >= rightSupport {
+					lower = math.Max(lower, float64(cue.End)/float64(time.Second))
+				} else {
+					upper = math.Min(upper, float64(cue.Start)/float64(time.Second)-durationSeconds)
+				}
+			}
+			next := candidate
+			if next < lower {
+				next = lower
+			}
+			if next > upper {
+				next = upper
+			}
+			if lower > upper || math.Abs(next-original) > maxMove || math.Abs(next-candidate) < 0.0005 {
+				break
+			}
+			candidate = next
+		}
+		if math.Abs(candidate-original) >= 0.0005 {
+			timeline.SetBoundary(fit, gapIndex, candidate)
+		}
+	}
+}
+
+// PreserveCrossLanguageCues prepares a language-independent activity fit for
+// translated subtitle rendering. Activity can prove a timeline discontinuity,
+// but cue-count differences cannot prove that target dialogue is disposable:
+// translators routinely split, merge, or add short explanatory cues. Keep all
+// target dialogue and move noisy cut boundaries away from supported cues.
+func PreserveCrossLanguageCues(reference, target []Cue, alignment Alignment) Alignment {
+	fit := timeline.Fit{
+		Scale: alignment.Scale, OffsetMS: alignment.OffsetMS, Score: alignment.Score,
+		Samples: alignment.Samples, ResidualMS: alignment.ResidualMS,
+		Segments: append([]timeline.Segment(nil), alignment.Segments...),
+		Gaps:     append([]timeline.Gap(nil), alignment.Gaps...),
+	}
+	protectSemanticGapCues(reference, target, &fit)
+	alignment.Segments = fit.Segments
+	alignment.Gaps = fit.Gaps
+	alignment.PreserveTargetCues = true
+	return alignment
+}
+
+func semanticCueTemporalSupport(reference []Cue, cue Cue, segment timeline.Segment) float64 {
+	scale := segment.Scale
+	if scale <= 0 {
+		scale = 1
+	}
+	start := float64(cue.Start)/float64(time.Second)*scale + float64(segment.OffsetMS)/1000
+	end := float64(cue.End)/float64(time.Second)*scale + float64(segment.OffsetMS)/1000
+	if end <= start {
+		return 0
+	}
+	best := 0.0
+	for _, candidate := range reference {
+		refStart := float64(candidate.Start) / float64(time.Second)
+		refEnd := float64(candidate.End) / float64(time.Second)
+		overlap := math.Max(0, math.Min(end, refEnd)-math.Max(start, refStart))
+		if overlap > 0 {
+			score := 2 * overlap / ((end - start) + (refEnd - refStart))
+			best = math.Max(best, score)
+		}
+		// Translations commonly start or end a short line one second away from
+		// the original even when both describe the same spoken phrase. Exact
+		// overlap alone would classify those edge differences as removable
+		// footage, so retain bounded midpoint proximity as weaker support.
+		midpointDistance := math.Abs((start+end)/2 - (refStart+refEnd)/2)
+		if midpointDistance < 2.5 {
+			best = math.Max(best, 1-midpointDistance/2.5)
+		}
+	}
+	return best
 }
 
 func semanticSeed(reference, target []Cue, opts AlignOptions) Alignment {

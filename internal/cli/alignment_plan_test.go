@@ -161,6 +161,9 @@ func TestAlignmentPlanSubtitleConversionRendersExactSegments(t *testing.T) {
 	plan, _ := validTestAlignmentPlan(t)
 	plan.Mode = "subtitles"
 	alignment := plan.subtitleAlignment(20, 20)
+	if !alignment.PreserveTargetCues {
+		t.Fatal("a verified sibling subtitle plan must preserve translated dialogue")
+	}
 	cues := []subtitle.Cue{
 		{Start: 10 * time.Second, End: 11 * time.Second, Text: []string{"before"}},
 		{Start: 70 * time.Second, End: 71 * time.Second, Text: []string{"after"}},

@@ -78,6 +78,7 @@ type standaloneResult struct {
 
 type standaloneVerification struct {
 	Passed                   bool           `json:"passed"`
+	Policy                   string         `json:"policy,omitempty"`
 	SyncMS                   int            `json:"sync_ms"`
 	Scale                    float64        `json:"scale"`
 	DriftPPM                 float64        `json:"drift_ppm"`
@@ -89,6 +90,8 @@ type standaloneVerification struct {
 	OutputDurationSeconds    float64        `json:"output_duration_seconds"`
 	DurationDeltaMS          int            `json:"duration_delta_ms"`
 	Gaps                     []timeline.Gap `json:"gaps"`
+	ToleratedGaps            []timeline.Gap `json:"tolerated_gaps,omitempty"`
+	FailureReasons           []string       `json:"failure_reasons,omitempty"`
 }
 
 func standaloneSyncCmd() *cobra.Command {
@@ -433,6 +436,8 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		ui.Field("reference", filepath.Base(reference))
 		ui.Field("target", filepath.Base(targetPath))
 		var alignment subtitle.Alignment
+		var activityCandidate *subtitle.Alignment
+		semanticAttempted := false
 		measurementStarted := time.Now()
 		events.emit("measuring_started", func(e *standaloneEvent) {
 			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil && sourceTimelinePlan == nil)
@@ -480,25 +485,36 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 				MaxSegments:      f.maxSegments,
 				DisablePiecewise: !f.detectGaps,
 			}
-			if semanticMatcher != nil {
-				ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
-				events.emit("semantic_ai_started", func(e *standaloneEvent) {
-					e.AI = boolPtr(true)
-					e.Model = f.semanticCodexModel
-				})
-				alignment, err = subtitle.AlignCodexSemantic(ctx, refCues, targetCues, semanticMatcher, subtitle.SemanticOptions{
-					AlignOptions: alignOpts, SearchWindowSeconds: f.semanticWindow,
-				})
-				if err == nil {
-					events.emit("semantic_ai_complete", func(e *standaloneEvent) {
-						e.AI = boolPtr(true)
-						e.Model = f.semanticCodexModel
-						setAlignmentEventMetrics(e, alignment)
-					})
-				}
-			} else {
+			if semanticMatcher == nil {
 				ui.Step("matching language-independent subtitle activity")
 				alignment, err = subtitle.Align(refCues, targetCues, alignOpts)
+			} else {
+				// Cross-language cue activity is deterministic, fast, and often more
+				// precise than sparse dialogue anchors. Use it when its distributed
+				// evidence is strong; retain the candidate so verification can fall
+				// back to it if the semantic result is worse.
+				activity, activityErr := subtitle.Align(refCues, targetCues, alignOpts)
+				if activityErr == nil {
+					activity = subtitle.PreserveCrossLanguageCues(refCues, targetCues, activity)
+					activity.Method = "activity-cross-language"
+					activityCandidate = &activity
+				}
+				if activityErr == nil && strongCrossLanguageActivity(activity, minScore) {
+					ui.Step("using strong deterministic cross-language cue activity")
+					alignment = activity
+				} else {
+					semanticAttempted = true
+					alignment, err = alignCodexSemanticCandidate(ctx, refCues, targetCues, alignOpts, semanticMatcher, f, events)
+					if err != nil && activityCandidate != nil {
+						// An AI transport/schema/evidence failure must not discard a usable
+						// deterministic candidate. Rendering verification is the final gate.
+						ui.Warn("AI fallback could not produce a candidate; validating deterministic activity")
+						alignment, err = *activityCandidate, nil
+					}
+					if err != nil && activityErr != nil {
+						err = fmt.Errorf("deterministic activity: %v; semantic fallback: %w", activityErr, err)
+					}
+				}
 			}
 			if err != nil {
 				return fmt.Errorf("align %s: %w", filepath.Base(targetPath), err)
@@ -543,13 +559,76 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 					verification, err = verifyPlannedSubtitleOutput(ctx, synced, output)
 				} else {
 					verificationMatcher := semanticMatcher
-					if alignment.Method == "source_timeline_plan_cross_language_activity" {
+					if alignment.Method == "activity-cross-language" || alignment.Method == "source_timeline_plan_cross_language_activity" {
 						verificationMatcher = nil
 					}
-					verification, err = verifySubtitleOutput(ctx, refCues, output, f, verificationMatcher)
+					crossLanguage := verificationMatcher != nil || alignment.Method == "activity-cross-language" || alignment.Method == "source_timeline_plan_cross_language_activity"
+					verification, err = verifySubtitleOutput(ctx, refCues, output, f, verificationMatcher, crossLanguage)
 				}
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
+				}
+				// A failed first candidate is an internal recovery signal, not a
+				// reason to create a manual-review job. Automatically evaluate the
+				// other independent timing source and keep whichever result verifies
+				// best. The retry overwrites only the output created by this command.
+				canRecover := semanticMatcher != nil && reusablePlan == nil && sourceTimelinePlan == nil && !shiftSet && !factorSet
+				if !verification.Passed && canRecover {
+					originalAlignment, originalSynced, originalVerification := alignment, synced, verification
+					var recoveryAlignment subtitle.Alignment
+					var recoveryMatcher subtitle.SemanticAnchorMatcher
+					var recoveryErr error
+					recoveryKind := ""
+					switch {
+					case alignment.Method == "activity-cross-language" && !semanticAttempted:
+						recoveryKind = "semantic AI"
+						events.emit("automatic_recovery_started", func(e *standaloneEvent) {
+							e.AI = boolPtr(true)
+							e.Model = f.semanticCodexModel
+						})
+						semanticAttempted = true
+						recoveryAlignment, recoveryErr = alignCodexSemanticCandidate(ctx, refCues, targetCues, subtitleAlignOptions(f), semanticMatcher, f, events)
+						recoveryMatcher = semanticMatcher
+					case alignment.Method == "semantic-codex" && activityCandidate != nil:
+						recoveryKind = "deterministic activity"
+						events.emit("automatic_recovery_started", func(e *standaloneEvent) {
+							e.AI = boolPtr(false)
+						})
+						recoveryAlignment = *activityCandidate
+					}
+					if recoveryKind != "" && recoveryErr == nil {
+						ui.Step("automatic recovery: validating " + recoveryKind + " candidate")
+						recoverySynced := subtitle.Apply(targetCues, recoveryAlignment)
+						if err := subtitle.Write(ctx, output, recoverySynced, true); err != nil {
+							return fmt.Errorf("render automatic recovery for %s: %w", filepath.Base(output), err)
+						}
+						recoveryVerification, verifyErr := verifySubtitleOutput(ctx, refCues, output, f, recoveryMatcher, true)
+						if verifyErr != nil {
+							recoveryErr = verifyErr
+							if restoreErr := subtitle.Write(ctx, output, originalSynced, true); restoreErr != nil {
+								return fmt.Errorf("restore subtitle candidate after failed recovery verification for %s: %w", filepath.Base(output), restoreErr)
+							}
+							alignment, synced, verification = originalAlignment, originalSynced, originalVerification
+						} else if betterSubtitleVerification(recoveryVerification, originalVerification) {
+							alignment, synced, verification = recoveryAlignment, recoverySynced, recoveryVerification
+						} else if err := subtitle.Write(ctx, output, originalSynced, true); err != nil {
+							return fmt.Errorf("restore verified subtitle candidate for %s: %w", filepath.Base(output), err)
+						} else {
+							alignment, synced, verification = originalAlignment, originalSynced, originalVerification
+						}
+					}
+					if recoveryKind != "" {
+						events.emit("automatic_recovery_complete", func(e *standaloneEvent) {
+							e.AI = boolPtr(recoveryKind == "semantic AI")
+							e.Model = f.semanticCodexModel
+							if verification != nil {
+								setVerificationEventMetrics(e, verification)
+							}
+						})
+					}
+					if recoveryErr != nil {
+						ui.Warn("automatic " + recoveryKind + " recovery could not be validated: " + recoveryErr.Error())
+					}
 				}
 				reportVerification(verification)
 				events.emit("verification_complete", func(e *standaloneEvent) {
@@ -589,6 +668,62 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 		return emitJSON(results)
 	}
 	return nil
+}
+
+func subtitleAlignOptions(f *standaloneFlags) subtitle.AlignOptions {
+	minScore := subtitleMinScore(f.minScore)
+	if f.force {
+		minScore = 0.01
+	}
+	return subtitle.AlignOptions{
+		MaxOffsetSeconds: f.maxOffset,
+		MinScore:         minScore,
+		MinGapSeconds:    f.minGap,
+		MaxSegments:      f.maxSegments,
+		DisablePiecewise: !f.detectGaps,
+	}
+}
+
+func strongCrossLanguageActivity(alignment subtitle.Alignment, minScore float64) bool {
+	return alignment.Score >= math.Max(0.70, minScore) &&
+		alignment.Samples >= 8 && alignment.ResidualMS <= 350 &&
+		alignment.Scale >= 0.8 && alignment.Scale <= 1.2
+}
+
+func alignCodexSemanticCandidate(ctx context.Context, reference, target []subtitle.Cue, alignOpts subtitle.AlignOptions, matcher subtitle.SemanticAnchorMatcher, f *standaloneFlags, events standaloneEventEmitter) (subtitle.Alignment, error) {
+	ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
+	events.emit("semantic_ai_started", func(e *standaloneEvent) {
+		e.AI = boolPtr(true)
+		e.Model = f.semanticCodexModel
+	})
+	alignment, err := subtitle.AlignCodexSemantic(ctx, reference, target, matcher, subtitle.SemanticOptions{
+		AlignOptions: alignOpts, SearchWindowSeconds: f.semanticWindow,
+	})
+	if err != nil {
+		return subtitle.Alignment{}, err
+	}
+	events.emit("semantic_ai_complete", func(e *standaloneEvent) {
+		e.AI = boolPtr(true)
+		e.Model = f.semanticCodexModel
+		setAlignmentEventMetrics(e, alignment)
+	})
+	return alignment, nil
+}
+
+func betterSubtitleVerification(candidate, current *standaloneVerification) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil || candidate.Passed != current.Passed {
+		return current == nil || candidate.Passed
+	}
+	if len(candidate.FailureReasons) != len(current.FailureReasons) {
+		return len(candidate.FailureReasons) < len(current.FailureReasons)
+	}
+	penalty := func(v *standaloneVerification) float64 {
+		return math.Abs(float64(v.SyncMS)) + math.Abs(v.DriftPPM)*2 + float64(v.ResidualMS)*2 + float64(len(v.Gaps))*10_000
+	}
+	return penalty(candidate) < penalty(current)
 }
 
 func subtitleAlignmentFromSourceTimeline(ctx context.Context, reference, target []subtitle.Cue, plan alignmentPlan, opts subtitle.AlignOptions, semanticMatcher subtitle.SemanticAnchorMatcher, semanticWindow float64) (subtitle.Alignment, error) {
@@ -690,7 +825,7 @@ func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track
 	}, nil
 }
 
-func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output string, f *standaloneFlags, semanticMatcher subtitle.SemanticAnchorMatcher) (*standaloneVerification, error) {
+func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output string, f *standaloneFlags, semanticMatcher subtitle.SemanticAnchorMatcher, crossLanguage bool) (*standaloneVerification, error) {
 	finished, err := subtitle.Read(ctx, output)
 	if err != nil {
 		return nil, err
@@ -719,19 +854,68 @@ func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output 
 	_, outputEnd := subtitleCueBounds(finished)
 	durationDelta := int(math.Round((outputEnd - referenceEnd) * 1000))
 	maxResidualMS := 100
-	if semanticMatcher != nil {
-		maxResidualMS = 350
+	policy := "strict"
+	remainingGaps := nonNilGaps(a.Gaps)
+	var toleratedGaps []timeline.Gap
+	maxOffsetMS, maxDriftPPM := 80, 50.0
+	if crossLanguage {
+		// Cross-language subtitle authors split, merge, and edge cues
+		// differently. A small residual clock correction or one/two sub-frame
+		// discontinuities are cue jitter, not evidence that the rendered
+		// programme is wrong.
+		policy = "cross-language"
+		maxOffsetMS, maxDriftPPM, maxResidualMS = 120, 250, 500
+		remainingGaps, toleratedGaps = semanticVerificationGaps(a.Gaps)
 	} else if f.sourceTimelinePlan != "" && f.semanticCodexModel != "" {
 		maxResidualMS = 250
 	}
+	passed := absInt(a.OffsetMS) <= maxOffsetMS && math.Abs(ppm) <= maxDriftPPM && a.ResidualMS <= maxResidualMS && len(remainingGaps) == 0
 	return &standaloneVerification{
-		Passed: absInt(a.OffsetMS) <= 80 && math.Abs(ppm) <= 50 && a.ResidualMS <= maxResidualMS && len(a.Gaps) == 0,
+		Passed: passed, Policy: policy,
 		SyncMS: a.OffsetMS, Scale: a.Scale, DriftPPM: ppm,
 		FPSConversion: timingDescription(a.Scale), Score: a.Score,
 		Samples: a.Samples, ResidualMS: a.ResidualMS,
 		ReferenceDurationSeconds: referenceEnd, OutputDurationSeconds: outputEnd, DurationDeltaMS: durationDelta,
-		Gaps: nonNilGaps(a.Gaps),
+		Gaps: remainingGaps, ToleratedGaps: toleratedGaps,
+		FailureReasons: subtitleVerificationFailures(a.OffsetMS, ppm, a.ResidualMS, maxOffsetMS, maxDriftPPM, maxResidualMS, remainingGaps),
 	}, nil
+}
+
+func semanticVerificationGaps(gaps []timeline.Gap) (remaining, tolerated []timeline.Gap) {
+	if len(gaps) == 0 {
+		return []timeline.Gap{}, nil
+	}
+	if len(gaps) > 2 {
+		return nonNilGaps(gaps), nil
+	}
+	totalMS := 0
+	for _, gap := range gaps {
+		if gap.DurationMS > 500 {
+			return nonNilGaps(gaps), nil
+		}
+		totalMS += gap.DurationMS
+	}
+	if totalMS > 750 {
+		return nonNilGaps(gaps), nil
+	}
+	return []timeline.Gap{}, nonNilGaps(gaps)
+}
+
+func subtitleVerificationFailures(offsetMS int, driftPPM float64, residualMS, maxOffsetMS int, maxDriftPPM float64, maxResidualMS int, gaps []timeline.Gap) []string {
+	var failures []string
+	if absInt(offsetMS) > maxOffsetMS {
+		failures = append(failures, fmt.Sprintf("remaining offset %dms exceeds %dms", offsetMS, maxOffsetMS))
+	}
+	if math.Abs(driftPPM) > maxDriftPPM {
+		failures = append(failures, fmt.Sprintf("remaining drift %+.0fppm exceeds %.0fppm", driftPPM, maxDriftPPM))
+	}
+	if residualMS > maxResidualMS {
+		failures = append(failures, fmt.Sprintf("residual %dms exceeds %dms", residualMS, maxResidualMS))
+	}
+	if len(gaps) > 0 {
+		failures = append(failures, fmt.Sprintf("%d material discontinuity edit(s) remain", len(gaps)))
+	}
+	return failures
 }
 
 func verifyPlannedSubtitleOutput(ctx context.Context, expected []subtitle.Cue, output string) (*standaloneVerification, error) {

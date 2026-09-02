@@ -305,5 +305,6 @@ func (plan alignmentPlan) subtitleAlignment(referenceCues, targetCues int) subti
 		Method: "plan", OffsetMS: plan.SyncMS, Scale: plan.Scale, Score: plan.Score,
 		ReferenceCues: referenceCues, TargetCues: targetCues, Samples: plan.Samples, ResidualMS: plan.ResidualMS,
 		Segments: append([]timeline.Segment(nil), plan.Segments...), Gaps: append([]timeline.Gap(nil), plan.Gaps...),
+		PreserveTargetCues: true,
 	}
 }

@@ -14,17 +14,18 @@ import (
 // reference = target*Scale + OffsetMS. It handles fixed delays, arbitrary
 // duration drift, and the usual film/TV frame-rate conversions.
 type Alignment struct {
-	Method        string
-	OffsetMS      int
-	Scale         float64
-	Score         float64
-	OriginalScore float64
-	ReferenceCues int
-	TargetCues    int
-	Samples       int
-	ResidualMS    int
-	Segments      []timeline.Segment
-	Gaps          []timeline.Gap
+	Method             string
+	OffsetMS           int
+	Scale              float64
+	Score              float64
+	OriginalScore      float64
+	ReferenceCues      int
+	TargetCues         int
+	Samples            int
+	ResidualMS         int
+	Segments           []timeline.Segment
+	Gaps               []timeline.Gap
+	PreserveTargetCues bool
 }
 
 type AlignOptions struct {
@@ -329,6 +330,9 @@ func applyPiecewise(cues []Cue, a Alignment) []Cue {
 	type removedRange struct{ start, end float64 }
 	var removed []removedRange
 	for i, gap := range a.Gaps {
+		if a.PreserveTargetCues {
+			break
+		}
 		if gap.DeltaMS >= 0 || i >= len(a.Segments) {
 			continue
 		}

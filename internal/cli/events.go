@@ -107,6 +107,16 @@ func standaloneEventMessage(name string, event standaloneEvent) string {
 		return fmt.Sprintf("AI fallback started for %s: %s is matching sparse cross-language dialogue anchors (no full subtitle translation)", progress, event.Model)
 	case "semantic_ai_complete":
 		return "AI semantic anchors matched for " + progress + "; RedSync is now calculating and validating timing deterministically"
+	case "automatic_recovery_started":
+		if event.AI != nil && *event.AI {
+			return "First timing candidate did not verify for " + progress + "; starting automatic AI recovery"
+		}
+		return "AI timing candidate did not verify for " + progress + "; validating the deterministic fallback"
+	case "automatic_recovery_complete":
+		if event.Passed != nil && *event.Passed {
+			return "Automatic recovery verified a safe timing candidate for " + progress
+		}
+		return "Automatic recovery compared all available timing candidates for " + progress
 	case "rendering_started":
 		return "Syncing " + progress
 	case "rendering_complete":

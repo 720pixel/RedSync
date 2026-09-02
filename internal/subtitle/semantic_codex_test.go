@@ -146,6 +146,44 @@ func TestCodexMatcherCachesPairsAcrossTimestampOnlyVerification(t *testing.T) {
 	}
 }
 
+func TestCodexMatcherRebindsCachedPairsAfterUnanchoredCueRemoval(t *testing.T) {
+	var reference, target []Cue
+	for i := 0; i < 60; i++ {
+		at := 20.0 + float64(i)*6
+		reference = append(reference, cueSeconds(at, at+1, fmt.Sprintf("Captain Mira confirms sector %d", i+200)))
+		target = append(target, cueSeconds(at+3, at+4, fmt.Sprintf("translated distinctive line %d", i+200)))
+	}
+	pairs := []SemanticAnchorPair{
+		{ReferenceFirst: 5, ReferenceLast: 5, TargetFirst: 5, TargetLast: 5},
+		{ReferenceFirst: 15, ReferenceLast: 15, TargetFirst: 15, TargetLast: 15},
+		{ReferenceFirst: 25, ReferenceLast: 25, TargetFirst: 25, TargetLast: 25},
+		{ReferenceFirst: 35, ReferenceLast: 35, TargetFirst: 35, TargetLast: 35},
+		{ReferenceFirst: 45, ReferenceLast: 45, TargetFirst: 45, TargetLast: 45},
+		{ReferenceFirst: 55, ReferenceLast: 55, TargetFirst: 55, TargetLast: 55},
+	}
+	calls := 0
+	m := &CodexAnchorMatcher{
+		cacheKey: semanticCueSetKey(reference, target), cache: pairs,
+		cacheRef: semanticCueTexts(reference), cacheTgt: semanticCueTexts(target),
+		Run: func(context.Context, string, []byte) ([]byte, error) {
+			calls++
+			return nil, fmt.Errorf("unexpected Codex call")
+		},
+	}
+	rendered := append([]Cue(nil), target[:10]...)
+	rendered = append(rendered, target[11:]...)
+	rebound, err := m.Match(context.Background(), reference, rendered, Alignment{}, SemanticOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("Codex calls = %d, want cached rebind without another call", calls)
+	}
+	if len(rebound) != len(pairs) || rebound[1].TargetFirst != 14 || rebound[len(rebound)-1].TargetFirst != 54 {
+		t.Fatalf("rebound pairs = %#v", rebound)
+	}
+}
+
 func cueSeconds(start, end float64, text string) Cue {
 	return Cue{
 		Start: time.Duration(math.Round(start * float64(time.Second))),

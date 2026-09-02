@@ -104,6 +104,96 @@ func TestApplyPiecewiseDropsTargetOnlySection(t *testing.T) {
 	}
 }
 
+func TestApplySemanticPiecewisePreservesTargetDialogue(t *testing.T) {
+	cues := []Cue{
+		secondsCue(90, 91, 1),
+		secondsCue(102, 103, 2),
+		secondsCue(110, 111, 3),
+	}
+	a := Alignment{
+		Scale: 1, PreserveTargetCues: true,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 100_000, OffsetMS: 0, Scale: 1},
+			{TargetStartMS: 105_000, TargetEndMS: 200_000, OffsetMS: -5_000, Scale: 1},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 100_000, DeltaMS: -5_000, DurationMS: 5_000, Action: "remove_target"}},
+	}
+	got := Apply(cues, a)
+	if len(got) != len(cues) {
+		t.Fatalf("semantic alignment removed dialogue: got %d cues, want %d", len(got), len(cues))
+	}
+}
+
+func TestProtectSemanticGapCuesMovesCutPastSupportedDialogue(t *testing.T) {
+	reference := []Cue{
+		secondsCue(30.177, 31.595, 1),
+		secondsCue(40.562, 43.231, 2),
+	}
+	target := []Cue{
+		secondsCue(39.410, 40.535, 1),
+		secondsCue(50.910, 52.118, 2),
+	}
+	fit := timeline.Fit{
+		Scale: 1,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 38_681, OffsetMS: -9_224, Scale: 1},
+			{TargetStartMS: 40_606, TargetEndMS: 60_000, OffsetMS: -11_149, Scale: 1},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 38_681, DeltaMS: -1_925, DurationMS: 1_925, Action: "remove_target"}},
+	}
+
+	protectSemanticGapCues(reference, target, &fit)
+	if fit.Gaps[0].TargetAtMS < 40_535 {
+		t.Fatalf("protected cue is still inside removal gap: %#v", fit.Gaps[0])
+	}
+	got := Apply(target, Alignment{Scale: 1, Segments: fit.Segments, Gaps: fit.Gaps})
+	if len(got) != len(target) {
+		t.Fatalf("supported dialogue was removed: got %d cues, want %d", len(got), len(target))
+	}
+}
+
+func TestProtectSemanticGapCuesPreservesUnmatchedSubtitleDialogue(t *testing.T) {
+	reference := []Cue{secondsCue(10, 11, 1), secondsCue(50, 51, 2)}
+	target := []Cue{secondsCue(20, 21, 1), secondsCue(32, 33, 99), secondsCue(46, 47, 2)}
+	fit := timeline.Fit{
+		Scale: 1,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 30_000, OffsetMS: -10_000, Scale: 1},
+			{TargetStartMS: 36_000, TargetEndMS: 60_000, OffsetMS: -16_000, Scale: 1},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 30_000, DeltaMS: -6_000, DurationMS: 6_000, Action: "remove_target"}},
+	}
+
+	protectSemanticGapCues(reference, target, &fit)
+	got := Apply(target, Alignment{Scale: 1, Segments: fit.Segments, Gaps: fit.Gaps, PreserveTargetCues: true})
+	if len(got) != len(target) {
+		t.Fatalf("subtitle-only alignment removed unmatched dialogue: %#v", got)
+	}
+}
+
+func TestProtectSemanticGapCuesKeepsNearEdgeDialogueOnRightSegment(t *testing.T) {
+	reference := []Cue{secondsCue(45.528, 47.363, 1)}
+	target := []Cue{secondsCue(53.287, 54.370, 1)}
+	fit := timeline.Fit{
+		Scale: 1,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 51_047, OffsetMS: -5_361, Scale: 1},
+			{TargetStartMS: 53_884, TargetEndMS: 60_000, OffsetMS: -8_739, Scale: 1},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 51_047, DeltaMS: -2_837, DurationMS: 2_837, Action: "remove_target"}},
+	}
+
+	protectSemanticGapCues(reference, target, &fit)
+	gapEnd := fit.Gaps[0].TargetAtMS + fit.Gaps[0].DurationMS
+	if gapEnd > 53_287 {
+		t.Fatalf("right-side dialogue is still inside removal gap: %#v", fit.Gaps[0])
+	}
+	got := Apply(target, Alignment{Scale: 1, Segments: fit.Segments, Gaps: fit.Gaps})
+	if len(got) != 1 {
+		t.Fatalf("right-side dialogue was removed: %#v", got)
+	}
+}
+
 func TestAlignRecoversOffsetAndSpeed(t *testing.T) {
 	var reference, target []Cue
 	scale, offset := 0.96, -3.2

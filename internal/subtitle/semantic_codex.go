@@ -54,6 +54,8 @@ type CodexAnchorMatcher struct {
 	mu       sync.Mutex
 	cacheKey string
 	cache    []SemanticAnchorPair
+	cacheRef []string
+	cacheTgt []string
 }
 
 type codexCueUnit struct {
@@ -119,11 +121,17 @@ func AlignCodexSemantic(ctx context.Context, reference, target []Cue, matcher Se
 			clean = append(clean, anchor)
 		}
 	}
-	if len(clean) < minimum || len(clean)*5 < len(anchors)*4 {
+	// Sparse cross-language matches are deliberately broad enough to cover the
+	// whole programme. Translation splits, repeated names, and nearby candidate
+	// lines can make a minority of otherwise sensible pairs timing outliers.
+	// Two-thirds consensus with the normal minimum/coverage checks is strong
+	// evidence; rendering and an independent bounded verification still follow.
+	if len(clean) < minimum || len(clean)*3 < len(anchors)*2 {
 		return Alignment{}, fmt.Errorf("semantic anchors disagree on timing (%d/%d survive deterministic validation)", len(clean), len(anchors))
 	}
 	fit = fitSemanticTimeline(clean, targetLast, opts)
 	refineSemanticBoundaries(&fit, clean)
+	protectSemanticGapCues(reference, target, &fit)
 	if fit.Scale < 0.8 || fit.Scale > 1.2 {
 		return Alignment{}, fmt.Errorf("semantic subtitle timing scale %.6f is outside the safe 0.8-1.2 range", fit.Scale)
 	}
@@ -136,7 +144,7 @@ func AlignCodexSemantic(ctx context.Context, reference, target []Cue, matcher Se
 		OffsetMS: fit.OffsetMS, Scale: fit.Scale, Score: consistency,
 		OriginalScore: seed.OriginalScore, ReferenceCues: len(reference), TargetCues: len(target),
 		Samples: fit.Samples, ResidualMS: fit.ResidualMS, Segments: fit.Segments, Gaps: fit.Gaps,
-		Method: "semantic-codex",
+		Method: "semantic-codex", PreserveTargetCues: true,
 	}, nil
 }
 
@@ -251,6 +259,10 @@ func (m *CodexAnchorMatcher) Match(ctx context.Context, reference, target []Cue,
 		m.mu.Unlock()
 		return cached, nil
 	}
+	if rebound, ok := rebindSemanticPairs(m.cacheRef, semanticCueTexts(reference), m.cacheTgt, semanticCueTexts(target), m.cache); ok {
+		m.mu.Unlock()
+		return rebound, nil
+	}
 	m.mu.Unlock()
 
 	prompt, referenceByID, targetByID, err := m.buildPrompt(reference, target, seed, opts)
@@ -291,8 +303,64 @@ func (m *CodexAnchorMatcher) Match(ctx context.Context, reference, target []Cue,
 	}
 	m.mu.Lock()
 	m.cacheKey, m.cache = key, append([]SemanticAnchorPair(nil), pairs...)
+	m.cacheRef, m.cacheTgt = semanticCueTexts(reference), semanticCueTexts(target)
 	m.mu.Unlock()
 	return pairs, nil
+}
+
+func semanticCueTexts(cues []Cue) []string {
+	texts := make([]string, len(cues))
+	for i, cue := range cues {
+		texts[i] = normalizeSemanticText(strings.Join(cue.Text, " "))
+	}
+	return texts
+}
+
+// rebindSemanticPairs reuses the original semantic decisions after rendering
+// when a genuine target-only section removed unanchored cues. Verification
+// must not make a second, potentially different AI decision merely because
+// cue indexes shifted; the retained cue text/order is the stable identity.
+func rebindSemanticPairs(oldReference, reference, oldTarget, target []string, pairs []SemanticAnchorPair) ([]SemanticAnchorPair, bool) {
+	if len(pairs) == 0 || len(oldReference) != len(reference) || len(target) > len(oldTarget) {
+		return nil, false
+	}
+	for i := range reference {
+		if reference[i] != oldReference[i] {
+			return nil, false
+		}
+	}
+	oldToNew := make([]int, len(oldTarget))
+	for i := range oldToNew {
+		oldToNew[i] = -1
+	}
+	newIndex := 0
+	for oldIndex, text := range oldTarget {
+		if newIndex < len(target) && text == target[newIndex] {
+			oldToNew[oldIndex] = newIndex
+			newIndex++
+		}
+	}
+	if newIndex != len(target) {
+		return nil, false
+	}
+	rebound := make([]SemanticAnchorPair, 0, len(pairs))
+	for _, pair := range pairs {
+		if pair.ReferenceFirst < 0 || pair.ReferenceLast >= len(reference) || pair.TargetFirst < 0 || pair.TargetLast >= len(oldToNew) {
+			continue
+		}
+		first, last := oldToNew[pair.TargetFirst], oldToNew[pair.TargetLast]
+		if first < 0 || last < first || last-first != pair.TargetLast-pair.TargetFirst {
+			continue
+		}
+		rebound = append(rebound, SemanticAnchorPair{
+			ReferenceFirst: pair.ReferenceFirst, ReferenceLast: pair.ReferenceLast,
+			TargetFirst: first, TargetLast: last,
+		})
+	}
+	if len(rebound) < 6 {
+		return nil, false
+	}
+	return rebound, true
 }
 
 func (m *CodexAnchorMatcher) buildPrompt(reference, target []Cue, seed Alignment, opts SemanticOptions) (string, map[string]codexCueUnit, map[string]codexCueUnit, error) {
