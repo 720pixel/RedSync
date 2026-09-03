@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/720pixel/RedSync/internal/timeline"
 )
 
 type fixedAnchorMatcher struct {
@@ -98,6 +101,60 @@ func TestCodexPromptKeepsAIOutOfTimingMath(t *testing.T) {
 	}
 	if len(prompt) > 200_000 {
 		t.Fatalf("prompt unexpectedly large: %d bytes", len(prompt))
+	}
+}
+
+func TestCodexVerificationVariantUsesDifferentDistributedCues(t *testing.T) {
+	var cues []Cue
+	for i := 0; i < 240; i++ {
+		at := 5.0 + float64(i)*8
+		cues = append(cues, cueSeconds(at, at+1.5, fmt.Sprintf("Commander Rivera confirms distinctive checkpoint number %d", i+1000)))
+	}
+	primary := selectDistinctiveCuesVariant(cues, 40, 0)
+	verification := selectDistinctiveCuesVariant(cues, 40, 1)
+	if len(primary) != 40 || len(verification) != 40 {
+		t.Fatalf("distributed selections = %d/%d, want 40/40", len(primary), len(verification))
+	}
+	if reflect.DeepEqual(primary, verification) {
+		t.Fatal("verification reused the candidate's distinctive cue sample")
+	}
+	for i := range primary {
+		if primary[i] == verification[i] {
+			t.Fatalf("bucket %d reused cue %d", i, primary[i])
+		}
+	}
+}
+
+func TestCodexVerificationVariantFailsClosedWithoutAlternateCues(t *testing.T) {
+	var cues []Cue
+	for i := 0; i < 40; i++ {
+		at := 5.0 + float64(i)*60
+		cues = append(cues, cueSeconds(at, at+1.5, fmt.Sprintf("Only distinctive checkpoint statement number %d", i+1000)))
+	}
+	primary := selectDistinctiveCuesVariant(cues, 40, 0)
+	verification := selectDistinctiveCuesVariant(cues, 40, 1)
+	if len(primary) < 30 || len(verification) != 0 {
+		t.Fatalf("sparse variants = %d/%d, want a primary sample and no reused verification evidence", len(primary), len(verification))
+	}
+}
+
+func TestSemanticAnchorDistributionRejectsUnmeasuredEndingAndInternalRegion(t *testing.T) {
+	distributed := []timeline.Anchor{
+		{TargetSeconds: 30}, {TargetSeconds: 150}, {TargetSeconds: 270},
+		{TargetSeconds: 390}, {TargetSeconds: 510}, {TargetSeconds: 630},
+		{TargetSeconds: 750}, {TargetSeconds: 870}, {TargetSeconds: 950},
+	}
+	if err := validateSemanticAnchorDistribution(distributed, 0, 1000); err != nil {
+		t.Fatalf("distributed anchors rejected: %v", err)
+	}
+	missingEnd := append([]timeline.Anchor(nil), distributed[:7]...)
+	if err := validateSemanticAnchorDistribution(missingEnd, 0, 1000); err == nil || !strings.Contains(err.Error(), "final") {
+		t.Fatalf("unmeasured ending was accepted: %v", err)
+	}
+	missingMiddle := append([]timeline.Anchor(nil), distributed[:3]...)
+	missingMiddle = append(missingMiddle, distributed[4:]...)
+	if err := validateSemanticAnchorDistribution(missingMiddle, 0, 1000); err == nil || !strings.Contains(err.Error(), "internal") {
+		t.Fatalf("unmeasured internal region was accepted: %v", err)
 	}
 }
 

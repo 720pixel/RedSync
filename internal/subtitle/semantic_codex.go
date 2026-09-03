@@ -47,6 +47,11 @@ type CodexAnchorMatcher struct {
 	ReasoningEffort string
 	Timeout         time.Duration
 	MaxAnchors      int
+	// CueSelectionVariant chooses a different distinctive cue from each time
+	// bucket. Production alignment uses zero; verification uses a non-zero
+	// variant so it cannot certify a timeline with the same sparse evidence
+	// that produced it.
+	CueSelectionVariant int
 
 	// Run is a test seam. Production leaves it nil and uses codex exec.
 	Run func(context.Context, string, []byte) ([]byte, error)
@@ -108,6 +113,9 @@ func AlignCodexSemantic(ctx context.Context, reference, target []Cue, matcher Se
 	if semanticAnchorBuckets(anchors, targetFirst, targetLast) < 3 {
 		return Alignment{}, fmt.Errorf("semantic anchors do not cover at least three programme regions")
 	}
+	if err := validateSemanticAnchorDistribution(anchors, targetFirst, targetLast); err != nil {
+		return Alignment{}, err
+	}
 
 	fit := fitSemanticTimeline(anchors, targetLast, opts)
 	if fit.Scale < 0.8 || fit.Scale > 1.2 {
@@ -128,6 +136,9 @@ func AlignCodexSemantic(ctx context.Context, reference, target []Cue, matcher Se
 	// evidence; rendering and an independent bounded verification still follow.
 	if len(clean) < minimum || len(clean)*3 < len(anchors)*2 {
 		return Alignment{}, fmt.Errorf("semantic anchors disagree on timing (%d/%d survive deterministic validation)", len(clean), len(anchors))
+	}
+	if err := validateSemanticAnchorDistribution(clean, targetFirst, targetLast); err != nil {
+		return Alignment{}, err
 	}
 	fit = fitSemanticTimeline(clean, targetLast, opts)
 	refineSemanticBoundaries(&fit, clean)
@@ -248,6 +259,34 @@ func semanticAnchorBuckets(anchors []timeline.Anchor, first, last float64) int {
 	return count
 }
 
+// validateSemanticAnchorDistribution prevents an apparently strong global fit
+// from silently extrapolating over an unmeasured opening, ending, or long
+// internal region. That is unsafe for edited streaming releases: a late ad
+// break can leave only the final minutes wrong while aggregate residuals still
+// look excellent.
+func validateSemanticAnchorDistribution(anchors []timeline.Anchor, first, last float64) error {
+	if len(anchors) < 2 || last <= first {
+		return fmt.Errorf("semantic anchors do not span a measurable programme timeline")
+	}
+	ordered := append([]timeline.Anchor(nil), anchors...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].TargetSeconds < ordered[j].TargetSeconds })
+	span := last - first
+	edgeLimit := math.Max(60, math.Min(90, span*0.04))
+	holeLimit := math.Max(120, math.Min(180, span*0.07))
+	if leading := ordered[0].TargetSeconds - first; leading > edgeLimit {
+		return fmt.Errorf("semantic anchors leave the first %.0fs unverified (limit %.0fs)", leading, edgeLimit)
+	}
+	if trailing := last - ordered[len(ordered)-1].TargetSeconds; trailing > edgeLimit {
+		return fmt.Errorf("semantic anchors leave the final %.0fs unverified (limit %.0fs)", trailing, edgeLimit)
+	}
+	for i := 1; i < len(ordered); i++ {
+		if hole := ordered[i].TargetSeconds - ordered[i-1].TargetSeconds; hole > holeLimit {
+			return fmt.Errorf("semantic anchors leave an internal %.0fs region unverified (limit %.0fs)", hole, holeLimit)
+		}
+	}
+	return nil
+}
+
 func (m *CodexAnchorMatcher) Match(ctx context.Context, reference, target []Cue, seed Alignment, opts SemanticOptions) ([]SemanticAnchorPair, error) {
 	if m == nil {
 		return nil, fmt.Errorf("Codex matcher is nil")
@@ -366,10 +405,10 @@ func rebindSemanticPairs(oldReference, reference, oldTarget, target []string, pa
 func (m *CodexAnchorMatcher) buildPrompt(reference, target []Cue, seed Alignment, opts SemanticOptions) (string, map[string]codexCueUnit, map[string]codexCueUnit, error) {
 	maxAnchors := m.MaxAnchors
 	if maxAnchors <= 0 {
-		maxAnchors = 28
+		maxAnchors = 40
 	}
 	maxAnchors = max(8, min(40, maxAnchors))
-	refIndexes := selectDistinctiveCues(reference, maxAnchors)
+	refIndexes := selectDistinctiveCuesVariant(reference, maxAnchors, m.CueSelectionVariant)
 	if len(refIndexes) < 6 {
 		return "", nil, nil, fmt.Errorf("not enough distinctive English cues for sparse matching")
 	}
@@ -405,7 +444,7 @@ func (m *CodexAnchorMatcher) buildPrompt(reference, target []Cue, seed Alignment
 	b.WriteString("Ignore target-only SDH descriptions such as music, doors, sighs, speaker labels, and sound effects. Names, numbers, places, and distinctive multi-clause dialogue are strongest evidence. ")
 	b.WriteString("The releases may have different delay, 23.976/24/25 fps timing, missing cues, and internal edits. Timestamps only narrow candidates; do not calculate timing or require equal timestamps. ")
 	b.WriteString("Return a globally chronological, one-to-one set of only unambiguous matches, and never overlap target cue ranges. A target ID can represent two consecutive cues only when one translated utterance was genuinely split; prefer the single-cue ID whenever it fully carries the meaning, and never merge two separate statements. Skip repeated/short/uncertain dialogue. Never invent IDs. ")
-	b.WriteString("Work through the programme from beginning to end and use names, numbers, objects, actions, and relationships to recover as many clear distributed anchors as the evidence supports. For matching releases, aim for 12-24 anchors rather than stopping after a small sample.\n\n")
+	b.WriteString("Work through the programme from beginning to end and use names, numbers, objects, actions, and relationships to recover as many clear distributed anchors as the evidence supports. For matching releases, aim for 28-40 anchors rather than stopping after a small sample, including evidence near both the beginning and ending.\n\n")
 	b.WriteString("ENGLISH REFERENCE ANCHORS\n")
 	for _, unit := range refUnits {
 		fmt.Fprintf(&b, "%s @ %.3fs | %s\n", unit.id, unit.mid, unit.text)
@@ -419,8 +458,15 @@ func (m *CodexAnchorMatcher) buildPrompt(reference, target []Cue, seed Alignment
 }
 
 func selectDistinctiveCues(cues []Cue, limit int) []int {
+	return selectDistinctiveCuesVariant(cues, limit, 0)
+}
+
+func selectDistinctiveCuesVariant(cues []Cue, limit, variant int) []int {
 	if len(cues) == 0 {
 		return nil
+	}
+	if variant < 0 {
+		variant = -variant
 	}
 	frequency := make(map[string]int)
 	for _, cue := range cues {
@@ -433,7 +479,11 @@ func selectDistinctiveCues(cues []Cue, limit int) []int {
 	for bucket := 0; bucket < limit; bucket++ {
 		bucketStart := first + span*float64(bucket)/float64(limit)
 		bucketEnd := first + span*float64(bucket+1)/float64(limit)
-		bestIndex, bestScore := -1, math.Inf(-1)
+		type candidate struct {
+			index int
+			score float64
+		}
+		var candidates []candidate
 		for index, cue := range cues {
 			mid := cueRangeMid(cues, index, index)
 			if mid < bucketStart || (bucket < limit-1 && mid >= bucketEnd) {
@@ -441,13 +491,26 @@ func selectDistinctiveCues(cues []Cue, limit int) []int {
 			}
 			text := cleanCodexCueText(cue)
 			score := codexCueDistinctiveness(text, frequency[normalizeSemanticText(text)])
-			if score > bestScore {
-				bestIndex, bestScore = index, score
+			if score >= 10 {
+				candidates = append(candidates, candidate{index: index, score: score})
 			}
 		}
-		if bestIndex >= 0 && bestScore >= 10 && !used[bestIndex] {
-			used[bestIndex] = true
-			chosen = append(chosen, bestIndex)
+		sort.SliceStable(candidates, func(i, j int) bool {
+			if candidates[i].score != candidates[j].score {
+				return candidates[i].score > candidates[j].score
+			}
+			return candidates[i].index < candidates[j].index
+		})
+		// Variants are deliberately disjoint. If a bucket has no alternate cue,
+		// omit that bucket and let the distribution/coverage gate fail closed
+		// instead of silently reusing candidate evidence during verification.
+		if variant >= len(candidates) {
+			continue
+		}
+		selected := candidates[variant].index
+		if !used[selected] {
+			used[selected] = true
+			chosen = append(chosen, selected)
 		}
 	}
 	sort.Ints(chosen)
