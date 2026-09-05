@@ -7,23 +7,25 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // names of the helpers we call. windows variants get .exe tacked on in resolve().
 const (
-	FFmpeg   = "ffmpeg"
-	FFprobe  = "ffprobe"
-	MkvMerge = "mkvmerge"
-	MkvExtr  = "mkvextract"
-	MkvProp  = "mkvpropedit"
-	Mediainf = "mediainfo"
-	DoviTool = "dovi_tool"
+	FFmpeg    = "ffmpeg"
+	FFprobe   = "ffprobe"
+	MkvMerge  = "mkvmerge"
+	MkvExtr   = "mkvextract"
+	MkvProp   = "mkvpropedit"
+	Mediainf  = "mediainfo"
+	DoviTool  = "dovi_tool"
 	Hdr10Plus = "hdr10plus_tool"
 )
 
@@ -138,4 +140,16 @@ func Cmd(name string, args ...string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return exec.Command(p, args...), nil
+}
+
+// CmdContext is used by synchronization work so a canceled decode/probe cannot
+// keep consuming CPU or hold a worker indefinitely after its job has stopped.
+func CmdContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
+	p, err := Path(name)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, p, args...)
+	cmd.WaitDelay = 5 * time.Second
+	return cmd, nil
 }

@@ -4,13 +4,17 @@ package subtitle
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/720pixel/RedSync/internal/tools"
 )
@@ -46,7 +50,7 @@ func Read(ctx context.Context, path string) ([]Cue, error) {
 		}
 		return parseTimedText(b)
 	}
-	cmd, err := tools.Cmd(tools.FFmpeg,
+	cmd, err := tools.CmdContext(ctx, tools.FFmpeg,
 		"-hide_banner", "-loglevel", "error", "-nostdin",
 		"-i", path, "-map", "0:s:0", "-f", "webvtt", "pipe:1",
 	)
@@ -63,6 +67,35 @@ func Read(ctx context.Context, path string) ([]Cue, error) {
 var timingLine = regexp.MustCompile(`^\s*((?:\d+:)?\d{1,2}:\d{2}[\.,]\d{3})\s*-->\s*((?:\d+:)?\d{1,2}:\d{2}[\.,]\d{3})(?:\s+.*)?$`)
 
 func parseTimedText(data []byte) ([]Cue, error) {
+	// Windows subtitle releases commonly use BOM-marked UTF-16. Decode it
+	// explicitly so a supported text file does not become an empty cue set.
+	if len(data) >= 2 && ((data[0] == 0xff && data[1] == 0xfe) || (data[0] == 0xfe && data[1] == 0xff)) {
+		var order binary.ByteOrder = binary.LittleEndian
+		if data[0] == 0xfe {
+			order = binary.BigEndian
+		}
+		if (len(data)-2)%2 != 0 {
+			return nil, fmt.Errorf("truncated UTF-16 subtitle")
+		}
+		units := make([]uint16, (len(data)-2)/2)
+		for i := range units {
+			units[i] = order.Uint16(data[2+i*2:])
+		}
+		for i := 0; i < len(units); i++ {
+			if units[i] >= 0xd800 && units[i] <= 0xdbff {
+				if i+1 >= len(units) || units[i+1] < 0xdc00 || units[i+1] > 0xdfff {
+					return nil, fmt.Errorf("invalid UTF-16 subtitle surrogate pair")
+				}
+				i++
+			} else if units[i] >= 0xdc00 && units[i] <= 0xdfff {
+				return nil, fmt.Errorf("invalid UTF-16 subtitle surrogate pair")
+			}
+		}
+		data = []byte(string(utf16.Decode(units)))
+	}
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("subtitle text is not valid UTF-8 or BOM-marked UTF-16")
+	}
 	s := strings.TrimPrefix(string(data), "\ufeff")
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
@@ -83,6 +116,15 @@ func parseTimedText(data []byte) ([]Cue, error) {
 		}
 		var text []string
 		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != ""; i++ {
+			if timingLine.MatchString(lines[i]) {
+				i-- // Missing blank separator: let the outer loop parse this cue.
+				break
+			}
+			if i+1 < len(lines) && timingLine.MatchString(lines[i+1]) {
+				if _, err := strconv.Atoi(strings.TrimSpace(lines[i])); err == nil {
+					continue
+				}
+			}
 			text = append(text, lines[i])
 		}
 		if end > start {
@@ -92,6 +134,9 @@ func parseTimedText(data []byte) ([]Cue, error) {
 	if len(cues) == 0 {
 		return nil, fmt.Errorf("no timed text cues found")
 	}
+	// ASS layers and hand-edited SRTs need not arrive in chronological order.
+	// Downstream monotonic matching requires time order; keep overlaps intact.
+	sort.SliceStable(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
 	return cues, nil
 }
 
@@ -149,7 +194,7 @@ func Write(ctx context.Context, path string, cues []Cue, overwrite bool) error {
 			args = append(args, "-n")
 		}
 		args = append(args, "-f", "webvtt", "-i", "pipe:0", path)
-		cmd, err := tools.Cmd(tools.FFmpeg, args...)
+		cmd, err := tools.CmdContext(ctx, tools.FFmpeg, args...)
 		if err != nil {
 			return err
 		}

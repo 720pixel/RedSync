@@ -92,9 +92,9 @@ func decodeAlignmentPlan(path string) (alignmentPlan, error) {
 }
 
 // readSourceTimelinePlan loads a verified audio plan for use as timing evidence
-// when an English subtitle anchor comes from the same source container. The
-// plan stays bound to its original audio reference; the subtitle path performs
-// a fresh residual fit and full verification against its own exact reference.
+// when a subtitle anchor comes from the same source container. The default path
+// performs a fresh subtitle residual fit; an explicitly authoritative caller
+// may instead replay the same-container clock and verify the rendered plan.
 func readSourceTimelinePlan(path string) (alignmentPlan, error) {
 	plan, err := decodeAlignmentPlan(path)
 	if err != nil {

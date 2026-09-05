@@ -114,7 +114,7 @@ type probeStream struct {
 
 // Probe runs ffprobe and returns a normalised File.
 func Probe(ctx context.Context, path string) (File, error) {
-	cmd, err := tools.Cmd(tools.FFprobe,
+	cmd, err := tools.CmdContext(ctx, tools.FFprobe,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_streams",

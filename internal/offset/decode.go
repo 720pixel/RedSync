@@ -33,7 +33,7 @@ func Decode(ctx context.Context, path string, trackIdx int, start, dur float64) 
 		"-c:a", "pcm_f32le",
 		"-",
 	)
-	cmd, err := tools.Cmd(tools.FFmpeg, args...)
+	cmd, err := tools.CmdContext(ctx, tools.FFmpeg, args...)
 	if err != nil {
 		return nil, err
 	}

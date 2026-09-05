@@ -423,6 +423,15 @@ compares the semantic residual with deterministic cue activity and uses only
 the tighter safe fit; semantic evidence cannot replace or alter the verified
 audio edit/gap topology.
 
+Callers that have independently proved the subtitle is embedded in the same
+source container as the verified audio anchor can add
+`--source-timeline-authoritative`. RedSync then applies the verified piecewise
+audio timeline directly, requires every cue to remain inside the source and
+reference coverage, and verifies every rendered timestamp and text line
+exactly. Sparse or translated subtitle references cannot veto that stronger
+same-container clock evidence; without this explicit flag, residual fitting
+and independent subtitle-reference verification remain unchanged.
+
 Plan reuse skips measurement but not rendering or final verification. Before
 rendering, RedSync rejects unknown schema fields, an unverified plan, media-type
 mismatch, a different reference digest/duration, unsafe scale, overlapping or
@@ -527,6 +536,9 @@ make release      # linux + windows into dist/
 ```
 
 ## Credits
+
+Synchronization recovery, verification policies and replay evidence are documented
+in [Sync reliability](docs/sync-reliability.md).
 
 RedSync would not exist without these projects:
 

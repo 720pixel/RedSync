@@ -208,3 +208,19 @@ func TestDriftFactor(t *testing.T) {
 		}
 	}
 }
+
+func TestInitialAudioWindowsRetainShortAndFullOffsetSearches(t *testing.T) {
+	got := initialAudioWindows(155)
+	want := []float64{65, 95, 155}
+	if len(got) != len(want) {
+		t.Fatalf("initial windows = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("initial windows = %#v, want %#v", got, want)
+		}
+	}
+	if got = initialAudioWindows(60); len(got) != 1 || got[0] != 60 {
+		t.Fatalf("bounded initial windows = %#v, want [60]", got)
+	}
+}

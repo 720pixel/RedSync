@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/720pixel/RedSync/internal/subtitle"
+	rsync "github.com/720pixel/RedSync/internal/sync"
 	"github.com/720pixel/RedSync/internal/timeline"
 )
 
@@ -128,6 +129,100 @@ func TestBetterSubtitleVerificationPrefersPassThenFewerFailures(t *testing.T) {
 	}
 	if !betterSubtitleVerification(closer, failed) {
 		t.Fatal("candidate with fewer failed safety bounds should win")
+	}
+}
+
+func TestComposeAudioVerificationResidualAddsMissedTargetCut(t *testing.T) {
+	base := rsync.Drift{
+		DelayMS: 1000, Scale: 1.04, Score: 8, Samples: 20,
+		Segments: []timeline.Segment{{
+			TargetStartMS: 0, TargetEndMS: 10_000, ReferenceStartMS: 1000, ReferenceEndMS: 11_400,
+			OffsetMS: 1000, Scale: 1.04, Score: 8, Samples: 20,
+		}},
+	}
+	residual := rsync.Drift{
+		DelayMS: 400, Scale: 1, Score: 7, Samples: 12,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 5000, ReferenceStartMS: 400, ReferenceEndMS: 5400, OffsetMS: 400, Scale: 1, Score: 7, Samples: 6},
+			{TargetStartMS: 5400, TargetEndMS: 11_400, ReferenceStartMS: 5400, ReferenceEndMS: 11_400, OffsetMS: 0, Scale: 1, Score: 7, Samples: 6},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 5000, ReferenceBeforeMS: 5400, ReferenceAfterMS: 5400, DeltaMS: -400, DurationMS: 400, Action: "remove_target"}},
+	}
+	got, err := composeAudioVerificationResidual(base, residual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Segments) != 2 || len(got.Gaps) != 1 {
+		t.Fatalf("composed audio timeline = segments %+v gaps %+v", got.Segments, got.Gaps)
+	}
+	if got.DelayMS != 1400 || math.Abs(got.Scale-1.04) > 0.0000001 || got.Gaps[0].Action != "remove_target" || got.Gaps[0].DurationMS != 400 {
+		t.Fatalf("composed audio residual = %+v", got)
+	}
+	if base.DelayMS != 1000 || len(base.Gaps) != 0 {
+		t.Fatalf("composition mutated its input: %+v", base)
+	}
+}
+
+func TestBoundedDubAudioVerificationDoesNotRelaxMaterialErrors(t *testing.T) {
+	near := rsync.Drift{
+		DelayMS: -110, Scale: 1, Score: 5.16, Samples: 20, ResidualMS: 68,
+		Gaps: []timeline.Gap{{DurationMS: 143, DeltaMS: -143, Action: "remove_target"}},
+	}
+	if !boundedDubAudioVerification(near, 22) {
+		t.Fatal("bounded cross-language waveform jitter was rejected")
+	}
+	for name, unsafe := range map[string]rsync.Drift{
+		"offset":   {DelayMS: 121, Scale: 1, Score: 6, Samples: 20},
+		"drift":    {Scale: 1.000251, Score: 6, Samples: 20},
+		"residual": {Scale: 1, Score: 6, Samples: 20, ResidualMS: 151},
+		"gap":      {Scale: 1, Score: 6, Samples: 20, Gaps: []timeline.Gap{{DurationMS: 251}}},
+		"score":    {Scale: 1, Score: 4.99, Samples: 20},
+		"samples":  {Scale: 1, Score: 6, Samples: 11},
+	} {
+		if boundedDubAudioVerification(unsafe, 22) {
+			t.Fatalf("unsafe dubbed-audio %s mismatch was accepted: %+v", name, unsafe)
+		}
+	}
+	if boundedDubAudioVerification(near, 101) {
+		t.Fatal("unsafe duration mismatch was accepted")
+	}
+}
+
+func TestDistinctAudioLanguagesNormalizesISOAliases(t *testing.T) {
+	if distinctAudioLanguages("en", "eng") || distinctAudioLanguages("fra", "fre") {
+		t.Fatal("equivalent ISO audio language aliases were treated as cross-language")
+	}
+	if !distinctAudioLanguages("eng", "deu") {
+		t.Fatal("English and German audio were treated as the same language")
+	}
+	if distinctAudioLanguages("und", "deu") || distinctAudioLanguages("", "deu") {
+		t.Fatal("unknown audio metadata was treated as proof of cross-language audio")
+	}
+}
+
+func TestStrongDistributedDubTimelineRejectsWeakOrLargeEdits(t *testing.T) {
+	strong := rsync.Drift{
+		DelayMS: 28000, Scale: 1.04262, Score: 6.88, Samples: 23, ResidualMS: 13,
+		Segments: []timeline.Segment{
+			{TargetStartMS: 0, TargetEndMS: 600000, ReferenceStartMS: 28000, ReferenceEndMS: 653572, OffsetMS: 28000, Scale: 1.04262, Score: 7, Samples: 5, ResidualMS: 10},
+			{TargetStartMS: 600480, TargetEndMS: 1200000, ReferenceStartMS: 653572, ReferenceEndMS: 1278671, OffsetMS: 27500, Scale: 1.04262, Score: 7, Samples: 6, ResidualMS: 12},
+		},
+		Gaps: []timeline.Gap{{TargetAtMS: 600000, ReferenceBeforeMS: 653572, ReferenceAfterMS: 653572, DeltaMS: -500, DurationMS: 500, Action: "remove_target"}},
+	}
+	if !strongDistributedDubTimeline(strong, 1278.671, 1200) {
+		t.Fatal("strong distributed dubbed timeline was rejected")
+	}
+	weak := strong
+	weak.Samples = 19
+	if strongDistributedDubTimeline(weak, 1278.671, 1200) {
+		t.Fatal("sparse primary timeline was accepted")
+	}
+	largeEdit := strong
+	largeEdit.Gaps = append([]timeline.Gap(nil), strong.Gaps...)
+	largeEdit.Gaps[0].DurationMS = 1001
+	largeEdit.Gaps[0].DeltaMS = -1001
+	if strongDistributedDubTimeline(largeEdit, 1278.671, 1200) {
+		t.Fatal("large unverified edit was accepted")
 	}
 }
 

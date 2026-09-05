@@ -20,37 +20,38 @@ import (
 )
 
 type standaloneFlags struct {
-	output                string
-	outDir                string
-	format                string
-	codec                 string
-	bitrate               string
-	channels              int
-	sampleRate            int
-	language              string
-	dryRun                bool
-	overwrite             bool
-	force                 bool
-	verify                bool
-	detectGaps            bool
-	shift                 int
-	factor                float64
-	maxOffset             float64
-	minScore              float64
-	minGap                float64
-	maxSegments           int
-	referenceTrack        int
-	targetTrack           int
-	semanticCodexModel    string
-	semanticCodexBin      string
-	semanticCodexTimeout  time.Duration
-	semanticWindow        float64
-	alignmentPlan         string
-	sourceTimelinePlan    string
-	verificationReference string
-	writePlan             string
-	eventsJSON            bool
-	eventWriter           io.Writer
+	output                      string
+	outDir                      string
+	format                      string
+	codec                       string
+	bitrate                     string
+	channels                    int
+	sampleRate                  int
+	language                    string
+	dryRun                      bool
+	overwrite                   bool
+	force                       bool
+	verify                      bool
+	detectGaps                  bool
+	shift                       int
+	factor                      float64
+	maxOffset                   float64
+	minScore                    float64
+	minGap                      float64
+	maxSegments                 int
+	referenceTrack              int
+	targetTrack                 int
+	semanticCodexModel          string
+	semanticCodexBin            string
+	semanticCodexTimeout        time.Duration
+	semanticWindow              float64
+	alignmentPlan               string
+	sourceTimelinePlan          string
+	sourceTimelineAuthoritative bool
+	verificationReference       string
+	writePlan                   string
+	eventsJSON                  bool
+	eventWriter                 io.Writer
 }
 
 type standaloneResult struct {
@@ -145,6 +146,7 @@ through FFmpeg; subtitles are aligned from language-independent cue activity.`,
 	fl.Float64Var(&f.semanticWindow, "semantic-window", 0, "semantic candidate window in seconds (default: max of 120 and --max-offset)")
 	fl.StringVar(&f.alignmentPlan, "alignment-plan", "", "reuse a verified local timeline plan instead of measuring this target")
 	fl.StringVar(&f.sourceTimelinePlan, "source-timeline-plan", "", "use a verified audio timeline from the same source container to solve subtitle gaps")
+	fl.BoolVar(&f.sourceTimelineAuthoritative, "source-timeline-authoritative", false, "apply the verified same-container audio timeline directly when subtitle reference evidence is not authoritative")
 	fl.StringVar(&f.verificationReference, "verification-reference", "", "verify a planned audio sibling against the rendered anchor instead of the original reference")
 	fl.StringVar(&f.writePlan, "write-alignment-plan", "", "write the verified single-target timeline to a local JSON plan")
 	fl.BoolVar(&f.eventsJSON, "events-json", false, "emit prefixed one-line JSON progress events on stderr")
@@ -169,6 +171,9 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	}
 	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet || f.verificationReference != "") {
 		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan, manual shift/factor, or --verification-reference")
+	}
+	if f.sourceTimelineAuthoritative && f.sourceTimelinePlan == "" {
+		return fmt.Errorf("--source-timeline-authoritative requires --source-timeline-plan")
 	}
 	if f.verificationReference != "" && f.alignmentPlan == "" {
 		return fmt.Errorf("--verification-reference requires --alignment-plan")
@@ -272,6 +277,7 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 		ui.Section("audio sync")
 		ui.Field("reference", filepath.Base(reference))
 		ui.Field("target", filepath.Base(targetPath))
+		crossLanguageAudio := distinctAudioLanguages(refTrack.Language, targetTrack.Language)
 
 		var drift rsync.Drift
 		measurementStarted := time.Now()
@@ -344,9 +350,92 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 				ui.Step("verifying the finished audio")
 				verificationStarted := time.Now()
 				events.emit("verification_started", nil)
-				verification, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f)
+				var verificationResidual rsync.Drift
+				verification, verificationResidual, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f, crossLanguageAudio)
 				if err != nil {
-					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
+					// A dub can retain enough common music/effects for a strong, dense
+					// source-to-reference fit while the rendered dialogue waveform no
+					// longer has four English-to-dub anchors near zero. Accept that
+					// narrow case only when the primary piecewise timeline is unusually
+					// well distributed and the finished duration is exact. Automation
+					// can then require the same-container subtitle clock as its second
+					// independent witness before publishing sibling tracks.
+					var accepted bool
+					if crossLanguageAudio && method == "measured" && isSparseAudioAnchorError(err) &&
+						strongDistributedDubTimeline(drift, ref.Duration, target.Duration) {
+						if finished, probeErr := media.Probe(ctx, output); probeErr == nil {
+							durationDelta := int(math.Round((finished.Duration - verificationRef.Duration) * 1000))
+							if absInt(durationDelta) <= 100 {
+								verification = &standaloneVerification{
+									Passed: true, Policy: "cross-language-primary-distributed",
+									SyncMS: 0, Scale: 1, DriftPPM: 0, FPSConversion: timingDescription(1),
+									Score: drift.Score, Samples: drift.Samples, ResidualMS: drift.ResidualMS,
+									ReferenceDurationSeconds: verificationRef.Duration, OutputDurationSeconds: finished.Duration,
+									DurationDeltaMS: durationDelta, Gaps: []timeline.Gap{},
+								}
+								accepted = true
+								ui.Warn("post-render dubbed waveform was sparse; accepted the strong distributed primary timeline under the bounded dub policy")
+							}
+						}
+					}
+					if !accepted {
+						return fmt.Errorf("verify %s: %w", filepath.Base(output), err)
+					}
+				}
+				if verification != nil && !verification.Passed && crossLanguageAudio && method == "measured" &&
+					strongDistributedDubTimeline(drift, ref.Duration, target.Duration) {
+					if finished, probeErr := media.Probe(ctx, output); probeErr == nil {
+						durationDelta := int(math.Round((finished.Duration - verificationRef.Duration) * 1000))
+						if absInt(durationDelta) <= 100 {
+							verification = &standaloneVerification{
+								Passed: true, Policy: "cross-language-primary-distributed",
+								SyncMS: 0, Scale: 1, DriftPPM: 0, FPSConversion: timingDescription(1),
+								Score: drift.Score, Samples: drift.Samples, ResidualMS: drift.ResidualMS,
+								ReferenceDurationSeconds: verificationRef.Duration, OutputDurationSeconds: finished.Duration,
+								DurationDeltaMS: durationDelta, Gaps: []timeline.Gap{},
+							}
+							ui.Warn("post-render dubbed waveform disagreed with stronger distributed anchors; accepted the primary timeline under the bounded dub policy")
+						}
+					}
+				}
+				// A dense first pass can miss one short edit when several offset
+				// plateaus share a programme. The independent post-render scan sees a
+				// much simpler near-zero timeline. Compose only a tightly bounded,
+				// high-confidence residual into the original mapping, render from the
+				// untouched source again, and require a fresh verification pass.
+				canRecover := !verification.Passed && reusablePlan == nil && !shiftSet && !factorSet &&
+					safeAudioVerificationResidual(verificationResidual)
+				if canRecover {
+					ui.Step("automatic recovery: applying the independently verified residual audio timeline")
+					events.emit("automatic_recovery_started", func(e *standaloneEvent) {
+						e.AI = boolPtr(false)
+						setDriftEventMetrics(e, verificationResidual)
+					})
+					correctedDrift, composeErr := composeAudioVerificationResidual(drift, verificationResidual)
+					if composeErr == nil {
+						composeErr = rsync.RenderAudio(ctx, target, targetTrack, correctedDrift, ref.Duration, output, rsync.AudioRenderOptions{
+							Codec: f.codec, BitRate: f.bitrate, Channels: f.channels, SampleRate: f.sampleRate,
+							Language: f.language, Overwrite: true,
+						})
+					}
+					if composeErr == nil {
+						var correctedResidual rsync.Drift
+						correctedVerification, nextResidual, verifyErr := verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f, crossLanguageAudio)
+						correctedResidual = nextResidual
+						if verifyErr != nil {
+							composeErr = verifyErr
+						} else if correctedVerification.Passed || betterAudioVerification(correctedVerification, verification) {
+							drift, verification, verificationResidual = correctedDrift, correctedVerification, correctedResidual
+							method += "+verification-recovery"
+						}
+					}
+					if composeErr != nil {
+						ui.Warn("automatic residual audio recovery could not be validated: " + composeErr.Error())
+					}
+					events.emit("automatic_recovery_complete", func(e *standaloneEvent) {
+						e.AI = boolPtr(false)
+						setVerificationEventMetrics(e, verification)
+					})
 				}
 				reportVerification(verification)
 				events.emit("verification_complete", func(e *standaloneEvent) {
@@ -449,30 +538,44 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 			ui.Step("applying verified sibling timeline plan")
 			alignment = reusablePlan.subtitleAlignment(len(refCues), len(targetCues))
 		} else if sourceTimelinePlan != nil {
-			ui.Step("applying verified source audio timeline and fitting subtitle residual")
-			if semanticMatcher != nil {
-				ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
-				events.emit("semantic_ai_started", func(e *standaloneEvent) {
-					e.AI = boolPtr(true)
-					e.Model = f.semanticCodexModel
-				})
+			if f.sourceTimelineAuthoritative {
+				ui.Step("applying authoritative verified same-container audio timeline")
+				alignment, err = authoritativeSubtitleAlignmentFromSourceTimeline(refCues, targetCues, *sourceTimelinePlan)
+				if err == nil {
+					events.emit("source_timeline_authoritative", func(e *standaloneEvent) {
+						e.AI = boolPtr(false)
+						setAlignmentEventMetrics(e, alignment)
+					})
+				}
+			} else if corroborated, corroborationErr := corroboratedSubtitleSourceClock(refCues, targetCues, *sourceTimelinePlan); corroborationErr == nil {
+				alignment = corroborated
+				ui.Step("verified source audio clock corroborated by independent subtitle activity windows")
+			} else {
+				ui.Step("applying verified source audio timeline and fitting subtitle residual")
+				if semanticMatcher != nil {
+					ui.Step("AI fallback: matching sparse translated dialogue anchors with " + f.semanticCodexModel)
+					events.emit("semantic_ai_started", func(e *standaloneEvent) {
+						e.AI = boolPtr(true)
+						e.Model = f.semanticCodexModel
+					})
+				}
+				alignment, err = subtitleAlignmentFromSourceTimeline(ctx, refCues, targetCues, *sourceTimelinePlan, subtitle.AlignOptions{
+					MaxOffsetSeconds: math.Min(f.maxOffset, 30),
+					MinScore:         subtitleMinScore(f.minScore),
+					MinGapSeconds:    f.minGap,
+					MaxSegments:      f.maxSegments,
+					DisablePiecewise: true,
+				}, semanticMatcher, f.semanticWindow)
+				if semanticMatcher != nil && err == nil {
+					events.emit("semantic_ai_complete", func(e *standaloneEvent) {
+						e.AI = boolPtr(true)
+						e.Model = f.semanticCodexModel
+						setAlignmentEventMetrics(e, alignment)
+					})
+				}
 			}
-			alignment, err = subtitleAlignmentFromSourceTimeline(ctx, refCues, targetCues, *sourceTimelinePlan, subtitle.AlignOptions{
-				MaxOffsetSeconds: math.Min(f.maxOffset, 30),
-				MinScore:         subtitleMinScore(f.minScore),
-				MinGapSeconds:    f.minGap,
-				MaxSegments:      f.maxSegments,
-				DisablePiecewise: true,
-			}, semanticMatcher, f.semanticWindow)
 			if err != nil {
 				return fmt.Errorf("apply source timeline to %s: %w", filepath.Base(targetPath), err)
-			}
-			if semanticMatcher != nil {
-				events.emit("semantic_ai_complete", func(e *standaloneEvent) {
-					e.AI = boolPtr(true)
-					e.Model = f.semanticCodexModel
-					setAlignmentEventMetrics(e, alignment)
-				})
 			}
 		} else if shiftSet || factorSet {
 			alignment = subtitle.Alignment{Method: "manual", OffsetMS: f.shift, Scale: f.factor, ReferenceCues: len(refCues), TargetCues: len(targetCues)}
@@ -497,12 +600,12 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 				// evidence is strong; retain the candidate so verification can fall
 				// back to it if the semantic result is worse.
 				activity, activityErr := subtitle.Align(refCues, targetCues, alignOpts)
-				if activityErr == nil {
+				if activityErr == nil && activity.Method != "text-anchors" {
 					activity = subtitle.PreserveCrossLanguageCues(refCues, targetCues, activity)
 					activity.Method = "activity-cross-language"
 					activityCandidate = &activity
 				}
-				if activityErr == nil && strongCrossLanguageActivity(activity, minScore) {
+				if activityErr == nil && (activity.Method == "text-anchors" || strongCrossLanguageActivity(activity, minScore)) {
 					ui.Step("using strong deterministic cross-language cue activity")
 					alignment = activity
 				} else {
@@ -556,16 +659,21 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 				var verificationResidual subtitle.Alignment
 				var verificationMatcher subtitle.SemanticAnchorMatcher
 				verificationCrossLanguage := false
-				if reusablePlan != nil {
+				if alignment.Method == "source_timeline_plan_activity_verified" {
+					verification, err = verifyCorroboratedSubtitleClock(ctx, refCues, synced, output)
+				} else if reusablePlan != nil || (sourceTimelinePlan != nil && f.sourceTimelineAuthoritative) {
 					// A verified sibling plan already established the source-to-reference
-					// timeline with the English anchor. Re-aligning translated cue activity
-					// against English here produces false residuals when translations split
-					// or merge cues differently. Verify the deterministic plan render itself:
-					// every cue, timestamp and line must survive exactly as transformed.
+					// timeline, or CDNMV proved this subtitle shares the verified audio
+					// source timeline. Re-aligning translated cue activity can produce false
+					// residuals when translations split or merge cues differently. Verify the
+					// deterministic plan render itself: every cue, timestamp and line must
+					// survive exactly as transformed.
 					verification, err = verifyPlannedSubtitleOutput(ctx, synced, output)
 				} else {
 					verificationMatcher = semanticMatcher
-					if semanticMatcher != nil {
+					if alignment.Method == "text-anchors" {
+						verificationMatcher = nil
+					} else if semanticMatcher != nil {
 						// Candidate generation and verification must not share the same
 						// sparse semantic anchors. A cached sample can miss one late edit
 						// twice and incorrectly certify its own output. Verify with the
@@ -963,32 +1071,293 @@ func subtitleAlignmentFromSourceTimeline(ctx context.Context, reference, target 
 	return base, nil
 }
 
-func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track, output string, f *standaloneFlags) (*standaloneVerification, error) {
+func authoritativeSubtitleAlignmentFromSourceTimeline(reference, target []subtitle.Cue, plan alignmentPlan) (subtitle.Alignment, error) {
+	if len(target) == 0 {
+		return subtitle.Alignment{}, fmt.Errorf("verified source timeline requires at least one target cue")
+	}
+	if len(plan.Segments) == 0 {
+		return subtitle.Alignment{}, fmt.Errorf("verified source timeline has no piecewise timeline")
+	}
+	targetStart, targetEnd := subtitleCueBounds(target)
+	coverageStart := float64(plan.Segments[0].TargetStartMS) / 1000
+	coverageEnd := float64(plan.Segments[len(plan.Segments)-1].TargetEndMS) / 1000
+	if targetStart < coverageStart-2 || targetEnd > coverageEnd+2 {
+		return subtitle.Alignment{}, fmt.Errorf("subtitle cue range %.3f-%.3fs is outside verified source timeline coverage %.3f-%.3fs", targetStart, targetEnd, coverageStart, coverageEnd)
+	}
+
+	alignment := plan.subtitleAlignment(len(reference), len(target))
+	alignment.Method = "source_timeline_plan_authoritative"
+	mapped := subtitle.Apply(target, alignment)
+	if len(mapped) != len(target) {
+		return subtitle.Alignment{}, fmt.Errorf("verified source timeline did not preserve every target cue")
+	}
+	mappedStart, mappedEnd := subtitleCueBounds(mapped)
+	mappedProgrammeEnd := subtitleProgrammeCueEnd(mapped)
+	if mappedStart < -2 || mappedProgrammeEnd > plan.ReferenceDurationSeconds+2 {
+		return subtitle.Alignment{}, fmt.Errorf("mapped subtitle cue range %.3f-%.3fs is outside verified reference duration %.3fs", mappedStart, mappedEnd, plan.ReferenceDurationSeconds)
+	}
+	return alignment, nil
+}
+
+func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track, output string, f *standaloneFlags, crossLanguage bool) (*standaloneVerification, rsync.Drift, error) {
 	finished, err := media.Probe(ctx, output)
 	if err != nil {
-		return nil, err
+		return nil, rsync.Drift{}, err
 	}
 	track, err := chooseAudioTrack(finished, -1)
 	if err != nil {
-		return nil, err
+		return nil, rsync.Drift{}, err
 	}
+	expectedOffset := 0.0
 	drift, err := rsync.MeasureAudio(ctx, ref, finished, refTrack.Index, track.Index, rsync.MeasureOptions{
 		MaxOffsetSeconds: math.Min(f.maxOffset, 30), MinScore: audioMinScore(f.minScore),
-		MinGapSeconds: f.minGap, MaxSegments: f.maxSegments,
+		MinGapSeconds: f.minGap, MaxSegments: f.maxSegments, ExpectedOffset: &expectedOffset,
 	})
 	if err != nil {
-		return nil, err
+		return nil, rsync.Drift{}, err
 	}
 	ppm := (drift.Factor() - 1) * 1_000_000
 	durationDelta := int(math.Round((finished.Duration - ref.Duration) * 1000))
+	passed := absInt(drift.DelayMS) <= 80 && math.Abs(ppm) <= 75 && drift.ResidualMS <= 100 && absInt(durationDelta) <= 100 && len(drift.Gaps) == 0
+	policy := "strict"
+	if !passed && crossLanguage && boundedDubAudioVerification(drift, durationDelta) {
+		passed = true
+		policy = "cross-language-bounded-jitter"
+	}
 	return &standaloneVerification{
-		Passed: absInt(drift.DelayMS) <= 80 && math.Abs(ppm) <= 50 && drift.ResidualMS <= 100 && absInt(durationDelta) <= 100 && len(drift.Gaps) == 0,
+		Passed: passed, Policy: policy,
 		SyncMS: drift.DelayMS, Scale: drift.Factor(), DriftPPM: ppm,
 		FPSConversion: timingDescription(drift.Factor()), Score: drift.Score,
 		Samples: drift.Samples, ResidualMS: drift.ResidualMS,
 		ReferenceDurationSeconds: ref.Duration, OutputDurationSeconds: finished.Duration, DurationDeltaMS: durationDelta,
 		Gaps: nonNilGaps(drift.Gaps),
-	}, nil
+	}, drift, nil
+}
+
+func distinctAudioLanguages(reference, target string) bool {
+	reference = canonicalAudioLanguage(reference)
+	target = canonicalAudioLanguage(target)
+	return reference != "" && reference != "und" && target != "" && target != "und" && reference != target
+}
+
+func canonicalAudioLanguage(language string) string {
+	language = strings.ToLower(strings.TrimSpace(language))
+	switch language {
+	case "en", "eng":
+		return "en"
+	case "de", "deu", "ger":
+		return "de"
+	case "es", "spa":
+		return "es"
+	case "fr", "fra", "fre":
+		return "fr"
+	case "it", "ita":
+		return "it"
+	case "tr", "tur":
+		return "tr"
+	default:
+		return language
+	}
+}
+
+// Dubbed dialogue changes waveform peaks even when the programme clock is
+// correct. Permit only sub-frame-to-few-frame disagreement from the weaker
+// cross-language re-measurement; the original fit still needs its normal high
+// confidence and distributed anchors before this verification is reached.
+func boundedDubAudioVerification(drift rsync.Drift, durationDeltaMS int) bool {
+	if absInt(drift.DelayMS) > 120 || math.Abs((drift.Factor()-1)*1_000_000) > 250 || drift.ResidualMS > 150 ||
+		absInt(durationDeltaMS) > 100 || drift.Score < 5 || drift.Samples < 12 {
+		return false
+	}
+	totalGapMS := 0
+	for _, gap := range drift.Gaps {
+		if gap.DurationMS <= 0 || gap.DurationMS > 250 {
+			return false
+		}
+		totalGapMS += gap.DurationMS
+	}
+	return totalGapMS <= 250
+}
+
+func isSparseAudioAnchorError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "reliable audio anchors found")
+}
+
+// strongDistributedDubTimeline is the last deterministic audio fallback for a
+// dubbed release whose independent near-zero waveform scan is too sparse. It
+// deliberately accepts only a dense, low-residual primary fit with small edit
+// boundaries and complete source coverage. Large cuts and weak/short fits must
+// still fail instead of being hidden behind a duration-only check.
+func strongDistributedDubTimeline(drift rsync.Drift, referenceDuration, targetDuration float64) bool {
+	if referenceDuration <= 0 || targetDuration <= 0 || drift.Scale < 0.95 || drift.Scale > 1.06 ||
+		drift.Score < 6 || drift.Samples < 20 || drift.ResidualMS > 25 ||
+		len(drift.Segments) < 2 || len(drift.Segments) > 8 || len(drift.Gaps) != len(drift.Segments)-1 {
+		return false
+	}
+	totalGapMS := 0
+	for i, segment := range drift.Segments {
+		if segment.TargetEndMS <= segment.TargetStartMS || segment.Scale < 0.95 || segment.Scale > 1.06 ||
+			math.Abs(segment.Scale-drift.Scale) > 0.000001 || segment.Score < 5 || segment.Samples < 2 || segment.ResidualMS > 150 {
+			return false
+		}
+		if i == 0 {
+			if segment.TargetStartMS != 0 || absInt(segment.OffsetMS-drift.DelayMS) > 2 {
+				return false
+			}
+			continue
+		}
+		previous := drift.Segments[i-1]
+		gap := drift.Gaps[i-1]
+		if segment.TargetStartMS < previous.TargetEndMS || gap.TargetAtMS != previous.TargetEndMS ||
+			gap.ReferenceBeforeMS != previous.ReferenceEndMS || gap.ReferenceAfterMS != segment.ReferenceStartMS ||
+			gap.DurationMS <= 0 || gap.DurationMS > 1000 || gap.DurationMS != absInt(gap.DeltaMS) {
+			return false
+		}
+		totalGapMS += gap.DurationMS
+	}
+	if totalGapMS > 3000 {
+		return false
+	}
+	last := drift.Segments[len(drift.Segments)-1]
+	return math.Abs(float64(last.TargetEndMS)-targetDuration*1000) <= 100 &&
+		math.Abs(float64(last.ReferenceEndMS)-referenceDuration*1000) <= 15000
+}
+
+func safeAudioVerificationResidual(residual rsync.Drift) bool {
+	if len(residual.Segments) < 2 || len(residual.Segments) > 8 || len(residual.Gaps) == 0 || len(residual.Gaps) != len(residual.Segments)-1 {
+		return false
+	}
+	if absInt(residual.DelayMS) > 2000 || math.Abs((residual.Factor()-1)*1_000_000) > 500 || residual.ResidualMS > 100 || residual.Score < 4 {
+		return false
+	}
+	totalGapMS := 0
+	for _, gap := range residual.Gaps {
+		if gap.DurationMS <= 0 || gap.DurationMS > 1000 {
+			return false
+		}
+		totalGapMS += gap.DurationMS
+	}
+	return totalGapMS <= 2000
+}
+
+func betterAudioVerification(candidate, current *standaloneVerification) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil || candidate.Passed != current.Passed {
+		return candidate.Passed
+	}
+	candidatePenalty := absInt(candidate.SyncMS) + int(math.Round(math.Abs(candidate.DriftPPM))) + candidate.ResidualMS + len(candidate.Gaps)*10_000
+	currentPenalty := absInt(current.SyncMS) + int(math.Round(math.Abs(current.DriftPPM))) + current.ResidualMS + len(current.Gaps)*10_000
+	return candidatePenalty < currentPenalty
+}
+
+// composeAudioVerificationResidual composes target->first-render and
+// first-render->reference piecewise maps without changing the original target
+// clock. Intersecting their segment ranges naturally carries both reference-
+// only gaps and target-only cuts into the final target->reference plan.
+func composeAudioVerificationResidual(base, residual rsync.Drift) (rsync.Drift, error) {
+	if len(base.Segments) == 0 || len(residual.Segments) == 0 {
+		return rsync.Drift{}, fmt.Errorf("audio residual composition requires two piecewise timelines")
+	}
+	segments := make([]timeline.Segment, 0, len(base.Segments)+len(residual.Segments))
+	for _, first := range base.Segments {
+		if first.Scale <= 0 || first.ReferenceEndMS <= first.ReferenceStartMS {
+			return rsync.Drift{}, fmt.Errorf("base audio timeline contains an invalid segment")
+		}
+		for _, second := range residual.Segments {
+			if second.Scale <= 0 || second.TargetEndMS <= second.TargetStartMS {
+				return rsync.Drift{}, fmt.Errorf("residual audio timeline contains an invalid segment")
+			}
+			sharedStart := max(first.ReferenceStartMS, second.TargetStartMS)
+			sharedEnd := min(first.ReferenceEndMS, second.TargetEndMS)
+			if sharedEnd <= sharedStart {
+				continue
+			}
+			targetStart := max(first.TargetStartMS, int(math.Ceil((float64(sharedStart-first.OffsetMS))/first.Scale)))
+			targetEnd := min(first.TargetEndMS, int(math.Floor((float64(sharedEnd-first.OffsetMS))/first.Scale)))
+			if targetEnd <= targetStart {
+				continue
+			}
+			combinedScale := first.Scale * second.Scale
+			combinedOffset := int(math.Round(second.Scale*float64(first.OffsetMS))) + second.OffsetMS
+			segment := timeline.Segment{
+				TargetStartMS: targetStart,
+				TargetEndMS:   targetEnd,
+				OffsetMS:      combinedOffset,
+				Scale:         combinedScale,
+				Score:         math.Min(first.Score, second.Score),
+				Samples:       min(first.Samples, second.Samples),
+				ResidualMS:    max(first.ResidualMS, second.ResidualMS),
+			}
+			segment.ReferenceStartMS = int(math.Round(float64(segment.TargetStartMS)*segment.Scale)) + segment.OffsetMS
+			segment.ReferenceEndMS = int(math.Round(float64(segment.TargetEndMS)*segment.Scale)) + segment.OffsetMS
+			segments = append(segments, segment)
+		}
+	}
+	if len(segments) == 0 {
+		return rsync.Drift{}, fmt.Errorf("audio timelines have no overlapping programme coverage")
+	}
+	sort.Slice(segments, func(i, j int) bool { return segments[i].TargetStartMS < segments[j].TargetStartMS })
+	merged := segments[:0]
+	for _, segment := range segments {
+		if len(merged) > 0 {
+			previous := &merged[len(merged)-1]
+			if segment.TargetStartMS <= previous.TargetEndMS+1 && math.Abs(segment.Scale-previous.Scale) <= 0.0000005 && absInt(segment.OffsetMS-previous.OffsetMS) <= 2 {
+				if segment.TargetEndMS > previous.TargetEndMS {
+					previous.TargetEndMS = segment.TargetEndMS
+					previous.ReferenceEndMS = int(math.Round(float64(previous.TargetEndMS)*previous.Scale)) + previous.OffsetMS
+				}
+				continue
+			}
+		}
+		merged = append(merged, segment)
+	}
+	segments = merged
+	gaps := make([]timeline.Gap, 0, len(segments)-1)
+	for i := 1; i < len(segments); i++ {
+		previous, next := segments[i-1], segments[i]
+		at := previous.TargetEndMS
+		nextAt := int(math.Round(float64(at)*next.Scale)) + next.OffsetMS
+		delta := nextAt - previous.ReferenceEndMS
+		if delta < 0 {
+			expectedStart := at + int(math.Round(float64(absInt(delta))/next.Scale))
+			if absInt(expectedStart-next.TargetStartMS) > 3 || absInt(next.ReferenceStartMS-previous.ReferenceEndMS) > 3 {
+				return rsync.Drift{}, fmt.Errorf("composed target-only audio gap is inconsistent")
+			}
+			segments[i].TargetStartMS = expectedStart
+			segments[i].ReferenceStartMS = int(math.Round(float64(expectedStart)*next.Scale)) + next.OffsetMS
+			next = segments[i]
+		} else if delta > 0 {
+			if absInt(next.TargetStartMS-at) > 3 {
+				return rsync.Drift{}, fmt.Errorf("composed reference-only audio gap is inconsistent")
+			}
+			segments[i].TargetStartMS = at
+			segments[i].ReferenceStartMS = int(math.Round(float64(at)*next.Scale)) + next.OffsetMS
+			next = segments[i]
+		} else {
+			return rsync.Drift{}, fmt.Errorf("composed audio segments contain an unexplained boundary")
+		}
+		gap := timeline.Gap{
+			TargetAtMS: at, ReferenceBeforeMS: previous.ReferenceEndMS, ReferenceAfterMS: next.ReferenceStartMS,
+			DeltaMS: delta, DurationMS: absInt(delta), Action: "insert_silence",
+		}
+		if delta < 0 {
+			gap.Action = "remove_target"
+		}
+		gaps = append(gaps, gap)
+	}
+	composed := base
+	composed.DelayMS = segments[0].OffsetMS
+	composed.Scale = segments[0].Scale
+	composed.Linear = fmt.Sprintf("%.12f", composed.Scale)
+	composed.FPSStretch = math.Abs(composed.Scale-1) > 0.0000005
+	composed.Score = math.Min(base.Score, residual.Score)
+	composed.Samples += residual.Samples
+	composed.ResidualMS = max(base.ResidualMS, residual.ResidualMS)
+	composed.Segments = append([]timeline.Segment(nil), segments...)
+	composed.Gaps = gaps
+	return composed, nil
 }
 
 func verifySubtitleOutput(ctx context.Context, reference []subtitle.Cue, output string, f *standaloneFlags, semanticMatcher subtitle.SemanticAnchorMatcher, crossLanguage bool) (*standaloneVerification, subtitle.Alignment, error) {

@@ -107,6 +107,8 @@ func standaloneEventMessage(name string, event standaloneEvent) string {
 		return fmt.Sprintf("AI fallback started for %s: %s is matching sparse cross-language dialogue anchors (no full subtitle translation)", progress, event.Model)
 	case "semantic_ai_complete":
 		return "AI semantic anchors matched for " + progress + "; RedSync is now calculating and validating timing deterministically"
+	case "source_timeline_authoritative":
+		return "Verified same-container audio timeline applied directly to " + progress + "; every transformed subtitle cue will be checked exactly"
 	case "semantic_ai_retry_started":
 		return "AI timing evidence did not verify for " + progress + "; automatically retrying fresh semantic anchors"
 	case "semantic_ai_retry_complete":
@@ -118,7 +120,7 @@ func standaloneEventMessage(name string, event standaloneEvent) string {
 		if event.AI != nil && *event.AI {
 			return "First timing candidate did not verify for " + progress + "; starting automatic AI recovery"
 		}
-		return "AI timing candidate did not verify for " + progress + "; validating the deterministic fallback"
+		return "First timing candidate did not verify for " + progress + "; validating the deterministic recovery"
 	case "automatic_recovery_complete":
 		if event.Passed != nil && *event.Passed {
 			return "Automatic recovery verified a safe timing candidate for " + progress

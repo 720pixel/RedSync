@@ -28,6 +28,7 @@ type MeasureOptions struct {
 	MinGapSeconds    float64
 	MaxSegments      int
 	DisablePiecewise bool
+	ExpectedOffset   *float64
 }
 
 // Factor returns the target-timestamp multiplier represented by a Drift.
@@ -91,12 +92,31 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	initialWin := math.Min(maxOffset+35, sharedDuration*0.22)
 	initialWin = clamp(initialWin, 35, 155)
 	initialWin = math.Min(initialWin, sharedDuration)
-	initial, initialScore, initialScale, err := initialAudioMatch(
-		ctx, ref.Path, refTrack, target.Path, targetTrack,
-		initialWin, minScore, ref.Duration, target.Duration,
-	)
-	if err != nil {
-		return Drift{}, fmt.Errorf("initial audio match: %w", err)
+	initial, initialScore, initialScale := 0, math.Inf(-1), 1.0
+	var initialErr error
+	if opts.ExpectedOffset != nil {
+		initial = int(math.Round(*opts.ExpectedOffset * 1000))
+		initialScore = minScore
+	} else {
+		for _, candidateWin := range initialAudioWindows(initialWin) {
+			candidate, score, scale, candidateErr := initialAudioMatch(
+				ctx, ref.Path, refTrack, target.Path, targetTrack,
+				candidateWin, minScore, ref.Duration, target.Duration,
+			)
+			if candidateErr != nil {
+				initialErr = candidateErr
+				continue
+			}
+			if score > initialScore {
+				initial, initialScore, initialScale, initialWin = candidate, score, scale, candidateWin
+			}
+		}
+	}
+	if math.IsInf(initialScore, -1) {
+		if initialErr == nil {
+			initialErr = fmt.Errorf("no usable search window")
+		}
+		return Drift{}, fmt.Errorf("initial audio match: %w", initialErr)
 	}
 	// The broad head probe is only a seed for the full-runtime search. Dubbed
 	// features can fall just below the strict acceptance score here when their
@@ -158,6 +178,9 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	probeCount := int(math.Ceil(sharedDuration/75)) + 1
 	probeCount = int(clamp(float64(probeCount), 9, 25))
 	for i := 0; i < probeCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return Drift{}, err
+		}
 		frac := 0.04 + 0.92*float64(i)/float64(probeCount-1)
 		x := target.Duration * frac
 		refAt := bestScale*x + bestInterceptGuess
@@ -170,9 +193,28 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 			anchors = append(anchors, audioAnchor{x: x, delay: float64(d) / 1000, score: score})
 		}
 	}
+	// Dialogue, silence or a changed opening can leave the regular probe grid
+	// without evidence in one programme region. Try alternate positions/window
+	// sizes there, requiring two windows to agree before accepting a new anchor.
+	for _, region := range missingAudioRegions(anchors, target.Duration) {
+		for _, within := range []float64{.12, .06, .19} {
+			x := target.Duration * (float64(region)*.25 + within)
+			if anchor, ok := recoverAudioRegion(ctx, ref, target, refTrack, targetTrack, x, bestScale, bestInterceptGuess, minScore); ok {
+				anchors = append(anchors, anchor)
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return Drift{}, err
+			}
+		}
+	}
 	if len(anchors) < 4 {
 		return Drift{}, fmt.Errorf("only %d reliable audio anchors found; need at least 4", len(anchors))
 	}
+	if missing := missingAudioRegions(anchors, target.Duration); len(missing) > 0 {
+		return Drift{}, fmt.Errorf("audio confidence lacks distributed evidence in %d/4 programme regions after automatic recovery", len(missing))
+	}
+	sort.Slice(anchors, func(i, j int) bool { return anchors[i].x < anchors[j].x })
 
 	timelineAnchors := make([]timeline.Anchor, len(anchors))
 	for i, a := range anchors {
@@ -214,6 +256,63 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 		d.Linear = formatScale(scale)
 	}
 	return d, nil
+}
+
+func missingAudioRegions(anchors []audioAnchor, duration float64) []int {
+	// Very short clips cannot fit an independent spectral window per quarter.
+	if duration < 90 {
+		return nil
+	}
+	var covered [4]bool
+	for _, anchor := range anchors {
+		if duration > 0 && anchor.x >= 0 && anchor.x <= duration {
+			covered[min(3, int(anchor.x/duration*4))] = true
+		}
+	}
+	var missing []int
+	for region, ok := range covered {
+		if !ok {
+			missing = append(missing, region)
+		}
+	}
+	return missing
+}
+
+func recoverAudioRegion(ctx context.Context, ref, target media.File, refTrack, targetTrack int, x, scale, intercept, minScore float64) (audioAnchor, bool) {
+	refAt := scale*x + intercept
+	var evidence []audioAnchor
+	for _, win := range []float64{18, 60} {
+		if ctx.Err() != nil || refAt < 0 || refAt+win*scale >= ref.Duration || x+win >= target.Duration {
+			continue
+		}
+		delay, score, err := offsetAtPositionsScaled(ctx, ref.Path, refTrack, refAt, target.Path, targetTrack, x, win, scale)
+		if err != nil || score < minScore+.5 {
+			continue
+		}
+		evidence = append(evidence, audioAnchor{x: x, delay: float64(delay) / 1000, score: score})
+	}
+	if len(evidence) != 2 || math.Abs(evidence[0].delay-evidence[1].delay) > .100 {
+		return audioAnchor{}, false
+	}
+	return audioAnchor{x: x, delay: (evidence[0].delay + evidence[1].delay) / 2, score: math.Min(evidence[0].score, evidence[1].score)}, true
+}
+
+func initialAudioWindows(maxWindow float64) []float64 {
+	var windows []float64
+	for _, candidate := range []float64{65, 95, maxWindow} {
+		candidate = math.Min(candidate, maxWindow)
+		if candidate <= 0 {
+			continue
+		}
+		duplicate := false
+		for _, existing := range windows {
+			duplicate = duplicate || math.Abs(existing-candidate) < 0.001
+		}
+		if !duplicate {
+			windows = append(windows, candidate)
+		}
+	}
+	return windows
 }
 
 // initialAudioMatch keeps the cheap same-speed path fast, but if its confidence
@@ -593,7 +692,7 @@ func RenderAudio(ctx context.Context, target media.File, track media.Track, drif
 		args = append(args, "-t", strconv.FormatFloat(refDuration, 'f', 6, 64))
 	}
 	args = append(args, output)
-	cmd, err := tools.Cmd(tools.FFmpeg, args...)
+	cmd, err := tools.CmdContext(ctx, tools.FFmpeg, args...)
 	if err != nil {
 		return err
 	}

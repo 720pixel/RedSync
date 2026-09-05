@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +64,14 @@ func TestSiblingVerificationReferenceRequiresVerifiedPlanRendering(t *testing.T)
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestAuthoritativeSourceTimelineRequiresVerifiedPlanFlag(t *testing.T) {
+	f := standaloneFlags{sourceTimelineAuthoritative: true, verify: true, minGap: 0.35, maxSegments: 8, semanticCodexTimeout: time.Second}
+	err := runStandaloneSync(context.Background(), "missing-reference", []string{"missing-target"}, &f, false, false)
+	if err == nil || !strings.Contains(err.Error(), "requires --source-timeline-plan") {
+		t.Fatalf("error = %v, want source timeline requirement", err)
 	}
 }
 
@@ -301,6 +310,97 @@ func TestSourceTimelineSubtitleAlignmentAddsVerifiedResidual(t *testing.T) {
 	}
 	if fallbackGot.Method != "source_timeline_plan_cross_language_activity" || fallbackGot.OffsetMS != got.OffsetMS {
 		t.Fatalf("unsafe semantic result did not fall back to tighter activity alignment: %+v", fallbackGot)
+	}
+}
+
+func TestAuthoritativeSourceTimelinePreservesCuesWithoutSubtitleEvidence(t *testing.T) {
+	plan, _ := validTestAlignmentPlan(t)
+	reference := []subtitle.Cue{{Start: 2 * time.Second, End: 3 * time.Second, Text: []string{"♪ ♪"}}}
+	target := []subtitle.Cue{
+		{Start: 10 * time.Second, End: 11 * time.Second, Text: []string{"one"}},
+		{Start: 70 * time.Second, End: 71 * time.Second, Text: []string{"two"}},
+		{Start: 115 * time.Second, End: 117 * time.Second, Text: []string{"three"}},
+	}
+
+	alignment, err := authoritativeSubtitleAlignmentFromSourceTimeline(reference, target, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alignment.Method != "source_timeline_plan_authoritative" || !alignment.PreserveTargetCues {
+		t.Fatalf("unexpected authoritative alignment: %+v", alignment)
+	}
+	mapped := subtitle.Apply(target, alignment)
+	if len(mapped) != len(target) || mapped[0].Start != 8*time.Second || mapped[1].Start != 73*time.Second {
+		t.Fatalf("verified audio mapping was not applied exactly: %#v", mapped)
+	}
+
+	outside := append([]subtitle.Cue(nil), target...)
+	outside[len(outside)-1].End = 130 * time.Second
+	if _, err := authoritativeSubtitleAlignmentFromSourceTimeline(reference, outside, plan); err == nil || !strings.Contains(err.Error(), "outside verified source timeline coverage") {
+		t.Fatalf("out-of-coverage subtitle accepted: %v", err)
+	}
+}
+
+func TestAuthoritativeSourceTimelinePreservesIsolatedTailCreditBeyondReference(t *testing.T) {
+	plan, _ := validTestAlignmentPlan(t)
+	plan.ReferenceDurationSeconds = 100
+	reference := []subtitle.Cue{{Start: 80 * time.Second, End: 81 * time.Second, Text: []string{"dialogue"}}}
+	target := []subtitle.Cue{
+		{Start: 80 * time.Second, End: 81 * time.Second, Text: []string{"dialogue"}},
+		{Start: 119 * time.Second, End: 120 * time.Second, Text: []string{"translation credit"}},
+	}
+	alignment, err := authoritativeSubtitleAlignmentFromSourceTimeline(reference, target, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped := subtitle.Apply(target, alignment)
+	if len(mapped) != len(target) || mapped[1].End <= time.Duration(plan.ReferenceDurationSeconds)*time.Second {
+		t.Fatalf("isolated tail credit was removed or unexpectedly moved: %#v", mapped)
+	}
+
+	target[0].End = 105 * time.Second
+	if _, err := authoritativeSubtitleAlignmentFromSourceTimeline(reference, target, plan); err == nil || !strings.Contains(err.Error(), "outside verified reference duration") {
+		t.Fatalf("programme dialogue outside the reference was accepted: %v", err)
+	}
+}
+
+func TestAuthoritativeSourceTimelineRendersAndVerifiesSparseReference(t *testing.T) {
+	ctx := context.Background()
+	plan, _ := validTestAlignmentPlan(t)
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "audio-plan.json")
+	referencePath := filepath.Join(dir, "german.vtt")
+	targetPath := filepath.Join(dir, "english.vtt")
+	outputPath := filepath.Join(dir, "synced.vtt")
+	if err := writeAlignmentPlan(planPath, plan, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := subtitle.Write(ctx, referencePath, []subtitle.Cue{{Start: 2 * time.Second, End: 3 * time.Second, Text: []string{"♪ ♪"}}}, false); err != nil {
+		t.Fatal(err)
+	}
+	target := []subtitle.Cue{
+		{Start: 10 * time.Second, End: 11 * time.Second, Text: []string{"one"}},
+		{Start: 70 * time.Second, End: 71 * time.Second, Text: []string{"two"}},
+	}
+	if err := subtitle.Write(ctx, targetPath, target, false); err != nil {
+		t.Fatal(err)
+	}
+	f := standaloneFlags{
+		output: outputPath, overwrite: true, verify: true, detectGaps: true,
+		factor: 1, minGap: 0.35, maxOffset: 300, maxSegments: 8,
+		semanticCodexTimeout: time.Second, sourceTimelinePlan: planPath,
+		sourceTimelineAuthoritative: true,
+	}
+	if err := runStandaloneSync(ctx, referencePath, []string{targetPath}, &f, false, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := subtitle.Read(ctx, outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := subtitle.Apply(target, plan.subtitleAlignment(1, len(target)))
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("authoritative output = %#v, want %#v", got, want)
 	}
 }
 

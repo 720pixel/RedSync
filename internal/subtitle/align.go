@@ -45,6 +45,9 @@ func Align(reference, target []Cue, opts AlignOptions) (Alignment, error) {
 	if len(reference) < 3 || len(target) < 3 {
 		return Alignment{}, fmt.Errorf("need at least 3 cues in both reference and target")
 	}
+	if alignment, ok := alignTextClock(reference, target, opts); ok {
+		return alignment, nil
+	}
 	maxOffset := opts.MaxOffsetSeconds
 	if maxOffset <= 0 {
 		maxOffset = 300
@@ -141,7 +144,11 @@ func Align(reference, target []Cue, opts AlignOptions) (Alignment, error) {
 // Apply retimes every cue and drops events that land wholly before zero.
 func Apply(cues []Cue, a Alignment) []Cue {
 	if len(a.Segments) > 1 {
-		return applyPiecewise(cues, a)
+		out := applyPiecewise(cues, a)
+		// Overlapping captions can straddle an edit and change relative order.
+		// Normalize before writing so the parser and plan verifier agree.
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Start < out[j].Start })
+		return out
 	}
 	scale := a.Scale
 	if scale <= 0 {
@@ -451,6 +458,9 @@ func fftOffset(reference, target []Cue, scale, step, maxOffset float64) float64 
 	_, refEnd := cueBounds(reference)
 	_, targetEnd := cueBounds(target)
 	targetEnd *= scale
+	// Bound scratch memory even for malformed end-credit timestamps. The
+	// exact interval refinement below still retains millisecond precision.
+	step = math.Max(step, math.Max(refEnd, targetEnd)/250000)
 	na := int(math.Ceil(math.Max(0, refEnd)/step)) + 2
 	nb := int(math.Ceil(math.Max(0, targetEnd)/step)) + 2
 	full := na + nb - 1
