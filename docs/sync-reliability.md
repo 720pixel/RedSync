@@ -13,6 +13,11 @@ More retries alone do not make weak timing evidence trustworthy.
 - Audio probes cover every programme quarter. Missing regions get alternate
   positions and two agreeing window sizes. Verified residuals can correct a
   missed cut through composition and re-rendering from original media.
+- Audio siblings that replay a verified same-source plan are checked against
+  their own untouched same-language source track. At least twelve anchors over
+  three programme regions must reproduce the plan's offset, scale, segments,
+  gaps, and rendered-anchor duration; unrelated cross-language waveform shape
+  is not used as the render-integrity gate.
 - Same-container subtitles can inherit a verified audio plan, retaining every
   cue. Separate companion files require their own distributed activity evidence.
   A residual correction is limited to 1.5 s intercept and 1000 ppm drift, with

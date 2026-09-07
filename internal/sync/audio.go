@@ -23,12 +23,13 @@ type audioAnchor struct {
 // MeasureOptions controls standalone audio analysis. Zero values select the
 // normal defaults, which are deliberately conservative for episode/movie audio.
 type MeasureOptions struct {
-	MaxOffsetSeconds float64
-	MinScore         float64
-	MinGapSeconds    float64
-	MaxSegments      int
-	DisablePiecewise bool
-	ExpectedOffset   *float64
+	MaxOffsetSeconds  float64
+	MinScore          float64
+	MinGapSeconds     float64
+	MaxSegments       int
+	DisablePiecewise  bool
+	ExpectedOffset    *float64
+	MinCoveredRegions int
 }
 
 // Factor returns the target-timestamp multiplier represented by a Drift.
@@ -211,7 +212,11 @@ func MeasureAudio(ctx context.Context, ref, target media.File, refTrack, targetT
 	if len(anchors) < 4 {
 		return Drift{}, fmt.Errorf("only %d reliable audio anchors found; need at least 4", len(anchors))
 	}
-	if missing := missingAudioRegions(anchors, target.Duration); len(missing) > 0 {
+	requiredRegions := opts.MinCoveredRegions
+	if requiredRegions <= 0 || requiredRegions > 4 {
+		requiredRegions = 4
+	}
+	if missing := missingAudioRegions(anchors, target.Duration); 4-len(missing) < requiredRegions {
 		return Drift{}, fmt.Errorf("audio confidence lacks distributed evidence in %d/4 programme regions after automatic recovery", len(missing))
 	}
 	sort.Slice(anchors, func(i, j int) bool { return anchors[i].x < anchors[j].x })

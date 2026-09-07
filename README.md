@@ -442,6 +442,13 @@ songs, or end credits. `--alignment-plan` cannot be combined with manual
 shift/factor, semantic measurement, or plan export. Existing behavior is
 unchanged when neither plan flag is present.
 
+When an audio sibling also supplies `--verification-reference`, RedSync verifies
+the rendered track against its own untouched same-language source audio and
+requires that fresh spectral measurement to reproduce the verified plan's
+offset, clock, segments, and gaps. The rendered anchor fixes the required output
+duration. This avoids treating English-to-dub waveform differences as a timing
+failure while retaining programme-wide render verification.
+
 ## Scripting RedSync
 
 Every command is non-interactive when you pass explicit flags, and `--json`

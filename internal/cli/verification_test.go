@@ -1,12 +1,16 @@
 package cli
 
 import (
+	"context"
 	"math"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/720pixel/RedSync/internal/media"
 	"github.com/720pixel/RedSync/internal/subtitle"
 	rsync "github.com/720pixel/RedSync/internal/sync"
 	"github.com/720pixel/RedSync/internal/timeline"
@@ -198,6 +202,85 @@ func TestDistinctAudioLanguagesNormalizesISOAliases(t *testing.T) {
 	if distinctAudioLanguages("und", "deu") || distinctAudioLanguages("", "deu") {
 		t.Fatal("unknown audio metadata was treated as proof of cross-language audio")
 	}
+}
+
+func TestAudioTimelineMatchesPlanRequiresExactStrongRender(t *testing.T) {
+	plan := alignmentPlan{
+		SyncMS: 1000, Scale: 1,
+		Segments: []timeline.Segment{{
+			TargetStartMS: 0, TargetEndMS: 1_200_000, ReferenceStartMS: 1000, ReferenceEndMS: 1_201_000,
+			OffsetMS: 1000, Scale: 1, Score: 8.5, Samples: 25, ResidualMS: 10,
+		}},
+		Gaps: []timeline.Gap{},
+	}
+	observed := rsync.Drift{
+		DelayMS: 1040, Scale: 1.00005, Score: 8, Samples: 25, ResidualMS: 30,
+		Segments: []timeline.Segment{{TargetStartMS: 0, TargetEndMS: 1_200_000, OffsetMS: 1040, Scale: 1.00005}},
+		Gaps:     []timeline.Gap{},
+	}
+	if !audioTimelineMatchesPlan(plan, observed) {
+		t.Fatal("matching planned render was rejected")
+	}
+	for name, mutate := range map[string]func(*rsync.Drift){
+		"few anchors":    func(d *rsync.Drift) { d.Samples = 11 },
+		"weak waveform":  func(d *rsync.Drift) { d.Score = 3.9 },
+		"large residual": func(d *rsync.Drift) { d.ResidualMS = 101 },
+		"large offset":   func(d *rsync.Drift) { d.DelayMS = 1081; d.Segments[0].OffsetMS = 1081 },
+		"large drift":    func(d *rsync.Drift) { d.Scale = 1.000076; d.Segments[0].Scale = 1.000076 },
+		"wrong boundary": func(d *rsync.Drift) { d.Segments[0].TargetEndMS += 251 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := observed
+			candidate.Segments = append([]timeline.Segment(nil), observed.Segments...)
+			mutate(&candidate)
+			if audioTimelineMatchesPlan(plan, candidate) {
+				t.Fatalf("unsafe planned render accepted: %+v", candidate)
+			}
+		})
+	}
+}
+
+func TestPlannedAudioOutputReplay(t *testing.T) {
+	referencePath := os.Getenv("REDSYNC_PLAN_REPLAY_REFERENCE")
+	targetPath := os.Getenv("REDSYNC_PLAN_REPLAY_TARGET")
+	outputPath := os.Getenv("REDSYNC_PLAN_REPLAY_OUTPUT")
+	anchorPath := os.Getenv("REDSYNC_PLAN_REPLAY_ANCHOR")
+	planPath := os.Getenv("REDSYNC_PLAN_REPLAY_PLAN")
+	if referencePath == "" || targetPath == "" || outputPath == "" || anchorPath == "" || planPath == "" {
+		t.Skip("set REDSYNC_PLAN_REPLAY_* paths for a local planned-audio verification replay")
+	}
+	trackIndex, err := strconv.Atoi(os.Getenv("REDSYNC_PLAN_REPLAY_TARGET_TRACK"))
+	if err != nil {
+		t.Fatal("REDSYNC_PLAN_REPLAY_TARGET_TRACK must be an integer")
+	}
+	ctx := context.Background()
+	reference, err := media.Probe(ctx, referencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := readAlignmentPlan(planPath, "audio", referencePath, reference.Duration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := media.Probe(ctx, targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetTrack, err := chooseAudioTrack(target, trackIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor, err := media.Probe(ctx, anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verification, observed, err := verifyPlannedAudioOutput(ctx, target, targetTrack, anchor, outputPath, plan, &standaloneFlags{
+		maxOffset: 300, minGap: .35, maxSegments: 16,
+	})
+	if err != nil || verification == nil || !verification.Passed {
+		t.Fatalf("planned output replay failed: verification=%+v observed=%+v err=%v", verification, observed, err)
+	}
+	t.Logf("planned output verified: verification=%+v observed=%+v", verification, observed)
 }
 
 func TestStrongDistributedDubTimelineRejectsWeakOrLargeEdits(t *testing.T) {

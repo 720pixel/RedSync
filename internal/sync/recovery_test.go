@@ -17,6 +17,10 @@ func TestAudioCoverageRejectsClusteredIntroMatches(t *testing.T) {
 	if missing := missingAudioRegions(distributed, 1200); len(missing) != 0 {
 		t.Fatalf("distributed anchors rejected: %v", missing)
 	}
+	threeQuarters := []audioAnchor{{x: 100}, {x: 400}, {x: 700}}
+	if missing := missingAudioRegions(threeQuarters, 1200); len(missing) != 1 || 4-len(missing) < 3 {
+		t.Fatalf("three-quarter planned-render evidence miscounted: %v", missing)
+	}
 }
 
 func TestAdaptiveAudioRecoveryRequiresTwoWindowAgreement(t *testing.T) {

@@ -351,8 +351,18 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 				verificationStarted := time.Now()
 				events.emit("verification_started", nil)
 				var verificationResidual rsync.Drift
-				verification, verificationResidual, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f, crossLanguageAudio)
+				if reusablePlan != nil && verificationReference != "" {
+					// The planned sibling can be a completely different dub, making a
+					// direct waveform comparison with the rendered English anchor
+					// meaningless. Verify the render against its own same-language
+					// source track and require that fresh measurement to reproduce the
+					// already verified source-to-reference plan.
+					verification, verificationResidual, err = verifyPlannedAudioOutput(ctx, target, targetTrack, verificationRef, output, *reusablePlan, f)
+				} else {
+					verification, verificationResidual, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f, crossLanguageAudio)
+				}
 				if err != nil {
+					var accepted bool
 					// A dub can retain enough common music/effects for a strong, dense
 					// source-to-reference fit while the rendered dialogue waveform no
 					// longer has four English-to-dub anchors near zero. Accept that
@@ -360,7 +370,6 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 					// well distributed and the finished duration is exact. Automation
 					// can then require the same-container subtitle clock as its second
 					// independent witness before publishing sibling tracks.
-					var accepted bool
 					if crossLanguageAudio && method == "measured" && isSparseAudioAnchorError(err) &&
 						strongDistributedDubTimeline(drift, ref.Duration, target.Duration) {
 						if finished, probeErr := media.Probe(ctx, output); probeErr == nil {
@@ -1132,6 +1141,67 @@ func verifyAudioOutput(ctx context.Context, ref media.File, refTrack media.Track
 		ReferenceDurationSeconds: ref.Duration, OutputDurationSeconds: finished.Duration, DurationDeltaMS: durationDelta,
 		Gaps: nonNilGaps(drift.Gaps),
 	}, drift, nil
+}
+
+// verifyPlannedAudioOutput checks a planned sibling using same-language audio:
+// the untouched source track is mapped into the rendered output's clock, and
+// that independently measured map must reproduce the verified plan. The
+// rendered anchor still supplies the exact required output duration.
+func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrack media.Track, verificationRef media.File, output string, plan alignmentPlan, f *standaloneFlags) (*standaloneVerification, rsync.Drift, error) {
+	finished, err := media.Probe(ctx, output)
+	if err != nil {
+		return nil, rsync.Drift{}, err
+	}
+	finishedTrack, err := chooseAudioTrack(finished, -1)
+	if err != nil {
+		return nil, rsync.Drift{}, err
+	}
+	expectedOffset := float64(plan.SyncMS) / 1000
+	observed, err := rsync.MeasureAudio(ctx, finished, target, finishedTrack.Index, targetTrack.Index, rsync.MeasureOptions{
+		MaxOffsetSeconds: math.Min(f.maxOffset, 30), MinScore: audioMinScore(f.minScore),
+		MinGapSeconds: f.minGap, MaxSegments: f.maxSegments, ExpectedOffset: &expectedOffset, MinCoveredRegions: 3,
+	})
+	if err != nil {
+		return nil, rsync.Drift{}, err
+	}
+	residualScale := observed.Factor() / plan.Scale
+	durationDelta := int(math.Round((finished.Duration - verificationRef.Duration) * 1000))
+	passed := audioTimelineMatchesPlan(plan, observed) && absInt(durationDelta) <= 100
+	remainingGaps := nonNilGaps(observed.Gaps)
+	if passed {
+		remainingGaps = []timeline.Gap{}
+	}
+	return &standaloneVerification{
+		Passed: passed, Policy: "source-plan-render-integrity",
+		SyncMS: observed.DelayMS - plan.SyncMS, Scale: residualScale, DriftPPM: (residualScale - 1) * 1_000_000,
+		FPSConversion: timingDescription(residualScale), Score: observed.Score,
+		Samples: observed.Samples, ResidualMS: observed.ResidualMS,
+		ReferenceDurationSeconds: verificationRef.Duration, OutputDurationSeconds: finished.Duration,
+		DurationDeltaMS: durationDelta, Gaps: remainingGaps,
+	}, observed, nil
+}
+
+func audioTimelineMatchesPlan(plan alignmentPlan, observed rsync.Drift) bool {
+	if plan.Scale <= 0 || observed.Score < 4 || observed.Samples < 12 || observed.ResidualMS > 100 ||
+		absInt(observed.DelayMS-plan.SyncMS) > 80 || math.Abs(observed.Factor()/plan.Scale-1) > .000075 ||
+		len(observed.Segments) != len(plan.Segments) || len(observed.Gaps) != len(plan.Gaps) {
+		return false
+	}
+	for i, expected := range plan.Segments {
+		actual := observed.Segments[i]
+		if absInt(actual.TargetStartMS-expected.TargetStartMS) > 250 || absInt(actual.TargetEndMS-expected.TargetEndMS) > 250 ||
+			absInt(actual.OffsetMS-expected.OffsetMS) > 80 || expected.Scale <= 0 || math.Abs(actual.Scale/expected.Scale-1) > .000075 {
+			return false
+		}
+	}
+	for i, expected := range plan.Gaps {
+		actual := observed.Gaps[i]
+		if actual.Action != expected.Action || absInt(actual.TargetAtMS-expected.TargetAtMS) > 250 ||
+			absInt(actual.DurationMS-expected.DurationMS) > 120 || absInt(actual.DeltaMS-expected.DeltaMS) > 120 {
+			return false
+		}
+	}
+	return true
 }
 
 func distinctAudioLanguages(reference, target string) bool {

@@ -41,7 +41,11 @@ Update this snapshot when alignment architecture or CLI contracts change.
   tracks. It validates reference identity, durations, monotonic segments,
   affine bounds, and gaps before rendering. This is the normal multilingual
   CinemaCity path: measure target English once, then make Hindi/Tamil/Telugu
-  and other siblings follow English exactly.
+  and other siblings follow English exactly. Planned audio output verification
+  compares each render with its own untouched same-language source track and
+  requires the observed timeline to reproduce the verified plan; the rendered
+  anchor independently fixes the exact output duration. This prevents sparse
+  cross-language waveforms from vetoing a proven same-container clock.
 - `--source-timeline-plan` handles mixed audio/subtitle sources with internal
   black intervals. It applies a verified audio plan to the same source's
   English subtitle anchor, fits one bounded residual subtitle offset, performs
