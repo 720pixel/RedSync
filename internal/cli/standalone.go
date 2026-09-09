@@ -1167,6 +1167,7 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 	residualScale := observed.Factor() / plan.Scale
 	durationDelta := int(math.Round((finished.Duration - verificationRef.Duration) * 1000))
 	passed := audioTimelineMatchesPlan(plan, observed) && absInt(durationDelta) <= 100
+	verificationPolicy := "source-plan-render-integrity"
 	if !passed && absInt(durationDelta) <= 100 && plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
 		probes, probeErr := rsync.VerifyRenderedAudioPlan(ctx, finished, finishedTrack.Index, target, targetTrack.Index, plan.Segments, audioMinScore(f.minScore))
 		if probeErr == nil {
@@ -1176,6 +1177,7 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 			observed.ResidualMS = probes.ResidualMS
 			residualScale = 1
 			passed = true
+			verificationPolicy = "source-plan-distributed-render-integrity"
 		}
 	}
 	remainingGaps := nonNilGaps(observed.Gaps)
@@ -1183,7 +1185,7 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 		remainingGaps = []timeline.Gap{}
 	}
 	return &standaloneVerification{
-		Passed: passed, Policy: "source-plan-render-integrity",
+		Passed: passed, Policy: verificationPolicy,
 		SyncMS: observed.DelayMS - plan.SyncMS, Scale: residualScale, DriftPPM: (residualScale - 1) * 1_000_000,
 		FPSConversion: timingDescription(residualScale), Score: observed.Score,
 		Samples: observed.Samples, ResidualMS: observed.ResidualMS,
