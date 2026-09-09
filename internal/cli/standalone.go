@@ -1193,15 +1193,8 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 }
 
 func plannedAudioTimelineSupportsSegmentProbes(plan alignmentPlan, observed rsync.Drift) bool {
-	if len(plan.Segments) < 2 || len(observed.Segments) == 0 || observed.Score < 4 || observed.Samples < 12 || observed.ResidualMS > 100 ||
-		math.Abs(observed.Factor()/plan.Scale-1) > .000075 {
-		return false
-	}
-	expectedLast := plan.Segments[len(plan.Segments)-1]
-	actualLast := observed.Segments[len(observed.Segments)-1]
-	return absInt(actualLast.TargetEndMS-expectedLast.TargetEndMS) <= 250 &&
-		absInt(actualLast.OffsetMS-expectedLast.OffsetMS) <= 80 &&
-		math.Abs(actualLast.Scale/expectedLast.Scale-1) <= .000075
+	return len(plan.Segments) >= 2 && len(observed.Segments) > 0 &&
+		observed.Score >= 4 && observed.Samples >= 12 && observed.ResidualMS <= 100
 }
 
 // plannedAudioVerificationMaxOffset retains the narrow 30-second search limit

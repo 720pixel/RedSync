@@ -259,7 +259,7 @@ func TestPlannedAudioVerificationMaxOffsetAllowsExactVerifiedPlan(t *testing.T) 
 	}
 }
 
-func TestPlannedAudioTimelineSegmentProbeFallbackRequiresStrongTerminalAgreement(t *testing.T) {
+func TestPlannedAudioTimelineSegmentProbeFallbackRequiresStrongGlobalEvidence(t *testing.T) {
 	plan := alignmentPlan{Scale: 1, Segments: []timeline.Segment{
 		{TargetStartMS: 0, TargetEndMS: 60_000, OffsetMS: 1_000, Scale: 1},
 		{TargetStartMS: 60_500, TargetEndMS: 120_000, OffsetMS: 500, Scale: 1},
@@ -271,9 +271,9 @@ func TestPlannedAudioTimelineSegmentProbeFallbackRequiresStrongTerminalAgreement
 	if !plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
 		t.Fatal("strong ambiguous timeline was not eligible for independent segment probes")
 	}
-	observed.Segments[1].OffsetMS = 600
+	observed.Samples = 11
 	if plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
-		t.Fatal("timeline with a wrong terminal mapping was eligible for fallback")
+		t.Fatal("sparse global timeline was eligible for fallback")
 	}
 }
 
