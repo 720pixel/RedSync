@@ -149,6 +149,23 @@ func TestAlignmentPlanRoundTripPreservesPiecewiseMapping(t *testing.T) {
 	}
 }
 
+func TestAudioDriftFromSubtitlePlanExtendsBoundedUncaptionedTail(t *testing.T) {
+	plan, _ := validTestAlignmentPlan(t)
+	plan.Mode = "subtitles"
+	plan.AnchorDurationSeconds = 120
+	drift, err := audioDriftFromSubtitlePlan(plan, 125)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := drift.Segments[len(drift.Segments)-1]
+	if last.TargetEndMS != 125000 || last.ReferenceEndMS != 128000 {
+		t.Fatalf("extended audio timeline = %+v", last)
+	}
+	if _, err := audioDriftFromSubtitlePlan(plan, 241); err == nil {
+		t.Fatal("subtitle plan with more than two minutes of missing source coverage was accepted")
+	}
+}
+
 func TestAlignmentPlanValidatesTargetOnlyGap(t *testing.T) {
 	plan, _ := validTestAlignmentPlan(t)
 	plan.Segments = []timeline.Segment{

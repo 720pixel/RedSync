@@ -48,6 +48,7 @@ type standaloneFlags struct {
 	alignmentPlan               string
 	sourceTimelinePlan          string
 	sourceTimelineAuthoritative bool
+	crossLanguageActivity       bool
 	verificationReference       string
 	writePlan                   string
 	eventsJSON                  bool
@@ -145,8 +146,9 @@ through FFmpeg; subtitles are aligned from language-independent cue activity.`,
 	fl.DurationVar(&f.semanticCodexTimeout, "semantic-codex-timeout", 45*time.Second, "maximum time for sparse Codex semantic matching")
 	fl.Float64Var(&f.semanticWindow, "semantic-window", 0, "semantic candidate window in seconds (default: max of 120 and --max-offset)")
 	fl.StringVar(&f.alignmentPlan, "alignment-plan", "", "reuse a verified local timeline plan instead of measuring this target")
-	fl.StringVar(&f.sourceTimelinePlan, "source-timeline-plan", "", "use a verified audio timeline from the same source container to solve subtitle gaps")
+	fl.StringVar(&f.sourceTimelinePlan, "source-timeline-plan", "", "use a verified audio or subtitle timeline from the same source container")
 	fl.BoolVar(&f.sourceTimelineAuthoritative, "source-timeline-authoritative", false, "apply the verified same-container audio timeline directly when subtitle reference evidence is not authoritative")
+	fl.BoolVar(&f.crossLanguageActivity, "cross-language-activity", false, "verify translated subtitle timing with independent deterministic cue activity without semantic AI")
 	fl.StringVar(&f.verificationReference, "verification-reference", "", "verify a planned audio sibling against the rendered anchor instead of the original reference")
 	fl.StringVar(&f.writePlan, "write-alignment-plan", "", "write the verified single-target timeline to a local JSON plan")
 	fl.BoolVar(&f.eventsJSON, "events-json", false, "emit prefixed one-line JSON progress events on stderr")
@@ -169,14 +171,14 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 	if f.alignmentPlan != "" && (shiftSet || factorSet || f.semanticCodexModel != "" || f.writePlan != "") {
 		return fmt.Errorf("--alignment-plan cannot be combined with manual shift/factor, --semantic-codex-model, or --write-alignment-plan")
 	}
-	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet || f.verificationReference != "") {
-		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan, manual shift/factor, or --verification-reference")
+	if f.sourceTimelinePlan != "" && (f.alignmentPlan != "" || shiftSet || factorSet) {
+		return fmt.Errorf("--source-timeline-plan cannot be combined with --alignment-plan or manual shift/factor")
 	}
 	if f.sourceTimelineAuthoritative && f.sourceTimelinePlan == "" {
 		return fmt.Errorf("--source-timeline-authoritative requires --source-timeline-plan")
 	}
-	if f.verificationReference != "" && f.alignmentPlan == "" {
-		return fmt.Errorf("--verification-reference requires --alignment-plan")
+	if f.verificationReference != "" && f.alignmentPlan == "" && f.sourceTimelinePlan == "" {
+		return fmt.Errorf("--verification-reference requires --alignment-plan or --source-timeline-plan")
 	}
 	if f.verificationReference != "" && (f.dryRun || !f.verify) {
 		return fmt.Errorf("--verification-reference requires output rendering and --verify=true")
@@ -215,10 +217,19 @@ func runStandaloneSync(ctx context.Context, reference string, targetArgs []strin
 		if f.verificationReference != "" {
 			return fmt.Errorf("--verification-reference is only valid for audio")
 		}
+		if f.crossLanguageActivity && f.semanticCodexModel != "" {
+			return fmt.Errorf("--cross-language-activity cannot be combined with --semantic-codex-model")
+		}
 		return syncSubtitleTargets(ctx, reference, targets, f, shiftSet, factorSet)
 	}
-	if f.sourceTimelinePlan != "" {
-		return fmt.Errorf("--source-timeline-plan is only valid for subtitles")
+	if f.sourceTimelineAuthoritative {
+		return fmt.Errorf("--source-timeline-authoritative is only valid for subtitles")
+	}
+	if f.crossLanguageActivity {
+		return fmt.Errorf("--cross-language-activity is only valid for subtitles")
+	}
+	if f.sourceTimelinePlan != "" && f.verificationReference == "" {
+		return fmt.Errorf("audio --source-timeline-plan requires --verification-reference")
 	}
 	return syncAudioTargets(ctx, reference, targets, f, shiftSet, factorSet)
 }
@@ -247,12 +258,20 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 		verificationReference = f.verificationReference
 	}
 	var reusablePlan *alignmentPlan
+	sourceSubtitlePlan := false
 	if f.alignmentPlan != "" {
 		plan, err := readAlignmentPlan(f.alignmentPlan, "audio", reference, ref.Duration)
 		if err != nil {
 			return err
 		}
 		reusablePlan = &plan
+	} else if f.sourceTimelinePlan != "" {
+		plan, err := readSourceSubtitleTimelinePlan(f.sourceTimelinePlan)
+		if err != nil {
+			return err
+		}
+		reusablePlan = &plan
+		sourceSubtitlePlan = true
 	}
 	var results []standaloneResult
 	if len(targets) > 1 {
@@ -285,13 +304,26 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 			e.Automatic = boolPtr(!shiftSet && !factorSet && reusablePlan == nil)
 		})
 		method := "measured"
+		var verificationPlan alignmentPlan
 		if reusablePlan != nil {
-			if !sameSourceDuration(reusablePlan.AnchorDurationSeconds, target.Duration) {
+			if sourceSubtitlePlan {
+				drift, err = audioDriftFromSubtitlePlan(*reusablePlan, target.Duration)
+				if err != nil {
+					return fmt.Errorf("source subtitle timeline for %s: %w", filepath.Base(targetPath), err)
+				}
+				audioPlan := *reusablePlan
+				audioPlan.Segments = append([]timeline.Segment(nil), drift.Segments...)
+				verificationPlan = audioPlan
+				ui.Step("applying verified same-container subtitle timeline")
+				method = "source_subtitle_plan"
+			} else if !sameSourceDuration(reusablePlan.AnchorDurationSeconds, target.Duration) {
 				return fmt.Errorf("alignment plan anchor duration %.3fs does not match sibling %s duration %.3fs", reusablePlan.AnchorDurationSeconds, filepath.Base(targetPath), target.Duration)
+			} else {
+				ui.Step("applying verified sibling timeline plan")
+				drift = reusablePlan.drift()
+				verificationPlan = *reusablePlan
+				method = "plan"
 			}
-			ui.Step("applying verified sibling timeline plan")
-			drift = reusablePlan.drift()
-			method = "plan"
 		} else if shiftSet || factorSet {
 			drift.DelayMS = f.shift
 			drift.Scale = f.factor
@@ -357,7 +389,10 @@ func syncAudioTargets(ctx context.Context, reference string, targets []string, f
 					// meaningless. Verify the render against its own same-language
 					// source track and require that fresh measurement to reproduce the
 					// already verified source-to-reference plan.
-					verification, verificationResidual, err = verifyPlannedAudioOutput(ctx, target, targetTrack, verificationRef, output, *reusablePlan, f)
+					verification, verificationResidual, err = verifyPlannedAudioOutput(ctx, target, targetTrack, verificationRef, output, verificationPlan, f)
+					if verification != nil && sourceSubtitlePlan {
+						verification.Policy = strings.Replace(verification.Policy, "source-plan-", "source-subtitle-plan-", 1)
+					}
 				} else {
 					verification, verificationResidual, err = verifyAudioOutput(ctx, verificationRef, verificationTrack, output, f, crossLanguageAudio)
 				}
@@ -603,6 +638,10 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 			if semanticMatcher == nil {
 				ui.Step("matching language-independent subtitle activity")
 				alignment, err = subtitle.Align(refCues, targetCues, alignOpts)
+				if err == nil && f.crossLanguageActivity && alignment.Method != "text-anchors" {
+					alignment = subtitle.PreserveCrossLanguageCues(refCues, targetCues, alignment)
+					alignment.Method = "activity-cross-language"
+				}
 			} else {
 				// Cross-language cue activity is deterministic, fast, and often more
 				// precise than sparse dialogue anchors. Use it when its distributed
@@ -691,6 +730,9 @@ func syncSubtitleTargets(ctx context.Context, reference string, targets []string
 					}
 					verificationCrossLanguage = verificationMatcher != nil || alignment.Method == "activity-cross-language" || alignment.Method == "source_timeline_plan_cross_language_activity"
 					verification, verificationResidual, err = verifySubtitleOutput(ctx, refCues, output, f, verificationMatcher, verificationCrossLanguage)
+					if verification != nil && f.crossLanguageActivity && verification.Policy == "cross-language" {
+						verification.Policy = "cross-language-activity"
+					}
 				}
 				if err != nil {
 					return fmt.Errorf("verify %s: %w", filepath.Base(output), err)

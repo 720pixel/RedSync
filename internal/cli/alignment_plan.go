@@ -109,6 +109,38 @@ func readSourceTimelinePlan(path string) (alignmentPlan, error) {
 	return plan, nil
 }
 
+func readSourceSubtitleTimelinePlan(path string) (alignmentPlan, error) {
+	plan, err := decodeAlignmentPlan(path)
+	if err != nil {
+		return alignmentPlan{}, err
+	}
+	if err := validateAlignmentPlan(plan, "subtitles"); err != nil {
+		return alignmentPlan{}, fmt.Errorf("source subtitle timeline plan: %w", err)
+	}
+	if len(plan.Segments) == 0 {
+		return alignmentPlan{}, fmt.Errorf("source subtitle timeline plan has no piecewise timeline")
+	}
+	return plan, nil
+}
+
+func audioDriftFromSubtitlePlan(plan alignmentPlan, targetDuration float64) (rsync.Drift, error) {
+	drift := plan.drift()
+	if targetDuration <= 0 || len(drift.Segments) == 0 || drift.Segments[0].TargetStartMS != 0 {
+		return rsync.Drift{}, fmt.Errorf("subtitle plan does not cover the source clock from zero")
+	}
+	targetEndMS := int(math.Round(targetDuration * 1000))
+	lastIndex := len(drift.Segments) - 1
+	last := drift.Segments[lastIndex]
+	missingTailMS := targetEndMS - last.TargetEndMS
+	if missingTailMS < -2000 || missingTailMS > 120000 {
+		return rsync.Drift{}, fmt.Errorf("subtitle plan source coverage differs from audio duration by %dms", missingTailMS)
+	}
+	last.TargetEndMS = targetEndMS
+	last.ReferenceEndMS = int(math.Round(float64(targetEndMS)*last.Scale)) + last.OffsetMS
+	drift.Segments[lastIndex] = last
+	return drift, nil
+}
+
 func validateAlignmentPlan(plan alignmentPlan, mode string) error {
 	if plan.SchemaVersion != alignmentPlanSchemaVersion {
 		return fmt.Errorf("unsupported alignment plan schema_version %d (want %d)", plan.SchemaVersion, alignmentPlanSchemaVersion)
