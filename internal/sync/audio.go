@@ -623,6 +623,89 @@ type AudioRenderOptions struct {
 	Overwrite  bool
 }
 
+// AudioPlanProbeVerification summarizes independent, same-language probes of a
+// rendered piecewise plan. Every segment must contribute multiple matches.
+type AudioPlanProbeVerification struct {
+	Score      float64
+	Samples    int
+	ResidualMS int
+}
+
+// VerifyRenderedAudioPlan checks the target-to-output mapping at distributed
+// positions inside every planned segment. It is a conservative fallback for a
+// global piecewise fit that finds an equivalent but ambiguous set of tiny edit
+// boundaries in the rendered audio.
+func VerifyRenderedAudioPlan(ctx context.Context, output media.File, outputTrack int, target media.File, targetTrack int, segments []timeline.Segment, minScore float64) (AudioPlanProbeVerification, error) {
+	if len(segments) < 2 {
+		return AudioPlanProbeVerification{}, fmt.Errorf("planned audio probe verification requires a piecewise timeline")
+	}
+	if minScore <= 0 {
+		minScore = 4
+	}
+	var scores []float64
+	maxResidualSeconds := 0.0
+	for i, segment := range segments {
+		segmentStart := float64(segment.TargetStartMS) / 1000
+		segmentDuration := float64(segment.TargetEndMS-segment.TargetStartMS) / 1000
+		if segmentDuration < 24 {
+			return AudioPlanProbeVerification{}, fmt.Errorf("planned audio segment %d is too short for independent probe verification", i+1)
+		}
+		window := math.Min(18, segmentDuration/5)
+		matched := 0
+		for _, fraction := range []float64{.08, .29, .50, .71, .92} {
+			targetAt := segmentStart + fraction*(segmentDuration-window)
+			outputAt := segment.Scale*targetAt + float64(segment.OffsetMS)/1000
+			if targetAt < 0 || targetAt+window > target.Duration || outputAt < 0 || outputAt+window*segment.Scale > output.Duration {
+				continue
+			}
+			correction, score, active, err := audioMappingCorrection(ctx, output.Path, outputTrack, outputAt, target.Path, targetTrack, targetAt, window, segment.Scale)
+			if err != nil {
+				return AudioPlanProbeVerification{}, fmt.Errorf("probe planned audio segment %d: %w", i+1, err)
+			}
+			if !active || score < minScore {
+				continue
+			}
+			residual := math.Abs(correction)
+			if residual > .080 {
+				return AudioPlanProbeVerification{}, fmt.Errorf("planned audio segment %d differs by %.0fms at a high-confidence probe", i+1, residual*1000)
+			}
+			matched++
+			scores = append(scores, score)
+			maxResidualSeconds = math.Max(maxResidualSeconds, residual)
+		}
+		if matched < 2 {
+			return AudioPlanProbeVerification{}, fmt.Errorf("planned audio segment %d has only %d independent probe match(es)", i+1, matched)
+		}
+	}
+	return AudioPlanProbeVerification{
+		Score: median(scores), Samples: len(scores), ResidualMS: int(math.Round(maxResidualSeconds * 1000)),
+	}, nil
+}
+
+func audioMappingCorrection(ctx context.Context, refPath string, refTrack int, refAt float64, targetPath string, targetTrack int, targetAt, window, scale float64) (float64, float64, bool, error) {
+	var a, b []float64
+	var ea, eb error
+	done := make(chan struct{}, 2)
+	go func() { a, ea = offsetDecode(ctx, refPath, refTrack, refAt, window*scale); done <- struct{}{} }()
+	go func() { b, eb = offsetDecode(ctx, targetPath, targetTrack, targetAt, window); done <- struct{}{} }()
+	<-done
+	<-done
+	if ea != nil {
+		return 0, 0, false, ea
+	}
+	if eb != nil {
+		return 0, 0, false, eb
+	}
+	if !audioWindowActive(a) || !audioWindowActive(b) {
+		return 0, 0, false, nil
+	}
+	result, err := offsetFindScaled(a, b, scale)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return result.Offset, result.Score, true, nil
+}
+
 // RenderAudio applies the measured affine timestamp map to the target samples.
 // atempo corrects speed without altering pitch, then atrim/adelay places the
 // result on the reference timeline. apad+atrim makes its duration deterministic.

@@ -185,6 +185,46 @@ func TestPiecewiseAudioFilterRepairsBothGapDirections(t *testing.T) {
 	}
 }
 
+func TestVerifyRenderedAudioPlanRequiresDistributedSegmentMatches(t *testing.T) {
+	originalDecode, originalFind := offsetDecode, offsetFindScaled
+	defer func() { offsetDecode, offsetFindScaled = originalDecode, originalFind }()
+	offsetDecode = func(context.Context, string, int, float64, float64) ([]float64, error) {
+		samples := make([]float64, 512)
+		for i := range samples {
+			samples[i] = .1
+		}
+		return samples, nil
+	}
+	offsetFindScaled = func(_, _ []float64, _ float64) (offset.Result, error) {
+		return offset.Result{Offset: .020, Score: 8}, nil
+	}
+
+	segments := []timeline.Segment{
+		{TargetStartMS: 0, TargetEndMS: 60_000, OffsetMS: 5_000, Scale: 1},
+		{TargetStartMS: 61_000, TargetEndMS: 120_000, OffsetMS: 4_000, Scale: 1},
+	}
+	got, err := VerifyRenderedAudioPlan(
+		context.Background(), media.File{Path: "output", Duration: 130}, 0,
+		media.File{Path: "target", Duration: 120}, 1, segments, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Samples != 10 || got.Score != 8 || got.ResidualMS != 20 {
+		t.Fatalf("plan probe verification = %+v", got)
+	}
+
+	offsetFindScaled = func(_, _ []float64, _ float64) (offset.Result, error) {
+		return offset.Result{Offset: .200, Score: 8}, nil
+	}
+	if _, err := VerifyRenderedAudioPlan(
+		context.Background(), media.File{Path: "output", Duration: 130}, 0,
+		media.File{Path: "target", Duration: 120}, 1, segments, 4,
+	); err == nil || !strings.Contains(err.Error(), "differs by 200ms") {
+		t.Fatalf("material planned-render mismatch was accepted: %v", err)
+	}
+}
+
 func TestExactFPSRatioMapsTargetToReference(t *testing.T) {
 	ref := media.Track{FPSNum: 24000, FPSDen: 1001}
 	target := media.Track{FPSNum: 25, FPSDen: 1}

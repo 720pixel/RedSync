@@ -1158,7 +1158,7 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 	}
 	expectedOffset := float64(plan.SyncMS) / 1000
 	observed, err := rsync.MeasureAudio(ctx, finished, target, finishedTrack.Index, targetTrack.Index, rsync.MeasureOptions{
-		MaxOffsetSeconds: math.Min(f.maxOffset, 30), MinScore: audioMinScore(f.minScore),
+		MaxOffsetSeconds: plannedAudioVerificationMaxOffset(f.maxOffset, expectedOffset), MinScore: audioMinScore(f.minScore),
 		MinGapSeconds: f.minGap, MaxSegments: f.maxSegments, ExpectedOffset: &expectedOffset, MinCoveredRegions: 3,
 	})
 	if err != nil {
@@ -1167,6 +1167,17 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 	residualScale := observed.Factor() / plan.Scale
 	durationDelta := int(math.Round((finished.Duration - verificationRef.Duration) * 1000))
 	passed := audioTimelineMatchesPlan(plan, observed) && absInt(durationDelta) <= 100
+	if !passed && absInt(durationDelta) <= 100 && plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
+		probes, probeErr := rsync.VerifyRenderedAudioPlan(ctx, finished, finishedTrack.Index, target, targetTrack.Index, plan.Segments, audioMinScore(f.minScore))
+		if probeErr == nil {
+			observed = plan.drift()
+			observed.Score = probes.Score
+			observed.Samples = probes.Samples
+			observed.ResidualMS = probes.ResidualMS
+			residualScale = 1
+			passed = true
+		}
+	}
 	remainingGaps := nonNilGaps(observed.Gaps)
 	if passed {
 		remainingGaps = []timeline.Gap{}
@@ -1179,6 +1190,30 @@ func verifyPlannedAudioOutput(ctx context.Context, target media.File, targetTrac
 		ReferenceDurationSeconds: verificationRef.Duration, OutputDurationSeconds: finished.Duration,
 		DurationDeltaMS: durationDelta, Gaps: remainingGaps,
 	}, observed, nil
+}
+
+func plannedAudioTimelineSupportsSegmentProbes(plan alignmentPlan, observed rsync.Drift) bool {
+	if len(plan.Segments) < 2 || len(observed.Segments) == 0 || observed.Score < 4 || observed.Samples < 12 || observed.ResidualMS > 100 ||
+		math.Abs(observed.Factor()/plan.Scale-1) > .000075 {
+		return false
+	}
+	expectedLast := plan.Segments[len(plan.Segments)-1]
+	actualLast := observed.Segments[len(observed.Segments)-1]
+	return absInt(actualLast.TargetEndMS-expectedLast.TargetEndMS) <= 250 &&
+		absInt(actualLast.OffsetMS-expectedLast.OffsetMS) <= 80 &&
+		math.Abs(actualLast.Scale/expectedLast.Scale-1) <= .000075
+}
+
+// plannedAudioVerificationMaxOffset retains the narrow 30-second search limit
+// for ordinary planned renders, but does not reject the exact offset supplied by
+// an already verified plan. The seeded measurement still has to independently
+// reproduce the plan's complete timeline in audioTimelineMatchesPlan.
+func plannedAudioVerificationMaxOffset(configuredMax, expectedOffset float64) float64 {
+	limit := math.Min(configuredMax, 30)
+	if limit <= 0 {
+		limit = 30
+	}
+	return math.Max(limit, math.Abs(expectedOffset))
 }
 
 func audioTimelineMatchesPlan(plan alignmentPlan, observed rsync.Drift) bool {

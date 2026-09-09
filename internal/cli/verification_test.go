@@ -240,6 +240,43 @@ func TestAudioTimelineMatchesPlanRequiresExactStrongRender(t *testing.T) {
 	}
 }
 
+func TestPlannedAudioVerificationMaxOffsetAllowsExactVerifiedPlan(t *testing.T) {
+	for name, tc := range map[string]struct {
+		configured float64
+		expected   float64
+		want       float64
+	}{
+		"ordinary offset keeps narrow limit": {configured: 300, expected: 12, want: 30},
+		"positive offset beyond limit":       {configured: 300, expected: 33.616, want: 33.616},
+		"negative offset beyond limit":       {configured: 300, expected: -41.250, want: 41.250},
+		"configured lower limit":             {configured: 20, expected: 12, want: 20},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := plannedAudioVerificationMaxOffset(tc.configured, tc.expected); got != tc.want {
+				t.Fatalf("verification max offset = %.3f, want %.3f", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlannedAudioTimelineSegmentProbeFallbackRequiresStrongTerminalAgreement(t *testing.T) {
+	plan := alignmentPlan{Scale: 1, Segments: []timeline.Segment{
+		{TargetStartMS: 0, TargetEndMS: 60_000, OffsetMS: 1_000, Scale: 1},
+		{TargetStartMS: 60_500, TargetEndMS: 120_000, OffsetMS: 500, Scale: 1},
+	}}
+	observed := rsync.Drift{Scale: 1, Score: 8, Samples: 20, ResidualMS: 10, Segments: []timeline.Segment{
+		{TargetStartMS: 0, TargetEndMS: 90_000, OffsetMS: 1_000, Scale: 1},
+		{TargetStartMS: 90_500, TargetEndMS: 120_000, OffsetMS: 500, Scale: 1},
+	}}
+	if !plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
+		t.Fatal("strong ambiguous timeline was not eligible for independent segment probes")
+	}
+	observed.Segments[1].OffsetMS = 600
+	if plannedAudioTimelineSupportsSegmentProbes(plan, observed) {
+		t.Fatal("timeline with a wrong terminal mapping was eligible for fallback")
+	}
+}
+
 func TestPlannedAudioOutputReplay(t *testing.T) {
 	referencePath := os.Getenv("REDSYNC_PLAN_REPLAY_REFERENCE")
 	targetPath := os.Getenv("REDSYNC_PLAN_REPLAY_TARGET")
