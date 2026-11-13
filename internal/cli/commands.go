@@ -557,13 +557,16 @@ func reportPlan(job rsync.Job, drifts map[string]rsync.Drift) {
 			role = append(role, "chapters")
 		}
 		ui.Field("source", fmt.Sprintf("%-34s %s", filepath.Base(c.File.Path), ui.Muted.Render(join(role))))
-		if c.Drift.DelayMS != 0 || c.Drift.Linear != "" {
-			msg := fmt.Sprintf("sync (ms) %+d", c.Drift.DelayMS)
+		if _, synced := drifts[c.File.Path]; synced || c.Drift.DelayMS != 0 || c.Drift.Linear != "" {
+			msg := "0 ms"
+			if c.Drift.DelayMS != 0 {
+				msg = fmt.Sprintf("%+d ms", c.Drift.DelayMS)
+			}
 			if c.Drift.FPSStretch {
 				msg += fmt.Sprintf("  scale %.9f  %s", c.Drift.Factor(), timingDescription(c.Drift.Factor()))
 				ui.Warn(fmt.Sprintf("%s: timing/FPS mismatch corrected (%s)", filepath.Base(c.File.Path), timingDescription(c.Drift.Factor())))
 			}
-			ui.Field("", ui.Accent.Render(msg))
+			ui.Field("offset", ui.Accent.Render(msg))
 		}
 	}
 	ui.Field("output", ui.Title.Render(filepath.Base(job.Output)))
