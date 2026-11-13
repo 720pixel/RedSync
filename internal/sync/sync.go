@@ -149,8 +149,10 @@ func perFile(c Contribution, fileIdx int, order *[]string, defAudioSet *bool) []
 		a = append(a, "--subtitle-tracks", ids(c.Subs))
 	}
 	if c.Chapters {
-		// avmux has no --chapter-sync; local avmux builds shift chapters after the mux.
-		if d := c.Drift.DelayMS; d != 0 && !tools.LocalAvmux {
+		// A source with no chapters gets no --chapter-sync: mkvmerge would warn and
+		// exit 1, failing a mux that actually succeeded. avmux has no --chapter-sync
+		// at all; local avmux builds shift chapters after the mux.
+		if d := c.Drift.DelayMS; d != 0 && c.File.HasChapters && !tools.LocalAvmux {
 			a = append(a, "--chapter-sync", strconv.Itoa(d))
 		}
 	} else {
