@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/720pixel/RedSync/internal/media"
+	"github.com/720pixel/RedSync/internal/tools"
 	"github.com/720pixel/RedSync/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -69,7 +70,11 @@ func Execute() {
 		SilenceErrors: true,
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.SetVersionTemplate("RedSync {{.Version}}\n")
+	if tools.LocalAvmux {
+		root.SetVersionTemplate("RedSync {{.Version}} (local avmux build)\n")
+	} else {
+		root.SetVersionTemplate("RedSync {{.Version}}\n")
+	}
 	root.Version = Version
 
 	pf := root.PersistentFlags()

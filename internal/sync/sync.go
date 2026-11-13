@@ -54,14 +54,17 @@ func Run(ctx context.Context, j Job) error {
 	args := build(j)
 
 	if j.DryRun {
-		ui.Section("dry run - mkvmerge command")
-		fmt.Println("mkvmerge " + strings.Join(quoteAll(args), " "))
+		ui.Section("dry run - " + tools.Muxer + " command")
+		fmt.Println(tools.Muxer + " " + strings.Join(quoteAll(args), " "))
+		if c, ok := avmuxChapterShift(j); ok {
+			fmt.Printf("# then shift chapters %+dms from %s onto the output with mkvpropedit\n", c.Drift.DelayMS, filepath.Base(c.File.Path))
+		}
 		return nil
 	}
 
 	// --gui-mode makes mkvmerge emit "#GUI#progress N%" lines we can turn into a
 	// clean bar instead of its raw progress spam.
-	cmd, err := tools.Cmd(tools.MkvMerge, append([]string{"--gui-mode"}, args...)...)
+	cmd, err := tools.Cmd(tools.Muxer, append([]string{"--gui-mode"}, args...)...)
 	if err != nil {
 		return err
 	}
@@ -81,11 +84,16 @@ func Run(ctx context.Context, j Job) error {
 			pct, _ := strconv.Atoi(m[1])
 			bar.Update(pct)
 		} else if w := guiWarn.FindStringSubmatch(sc.Text()); w != nil {
-			ui.Warn("mkvmerge: " + w[1])
+			ui.Warn(tools.Muxer + ": " + w[1])
 		}
 	}
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("mkvmerge: %w", err)
+		return fmt.Errorf("%s: %w", tools.Muxer, err)
+	}
+	if c, ok := avmuxChapterShift(j); ok {
+		if err := shiftChapters(ctx, c.File.Path, j.Output, c.Drift.DelayMS); err != nil {
+			return err
+		}
 	}
 	bar.Done("wrote " + filepath.Base(j.Output))
 	return nil
@@ -99,7 +107,7 @@ var (
 // CommandString returns the full mkvmerge command line this job would run, shell
 // quoted, so dry-runs and JSON callers can inspect or reuse it verbatim.
 func CommandString(j Job) string {
-	return "mkvmerge " + strings.Join(quoteAll(build(j)), " ")
+	return tools.Muxer + " " + strings.Join(quoteAll(build(j)), " ")
 }
 
 // build turns a Job into the full mkvmerge argv.
@@ -141,7 +149,8 @@ func perFile(c Contribution, fileIdx int, order *[]string, defAudioSet *bool) []
 		a = append(a, "--subtitle-tracks", ids(c.Subs))
 	}
 	if c.Chapters {
-		if d := c.Drift.DelayMS; d != 0 {
+		// avmux has no --chapter-sync; local avmux builds shift chapters after the mux.
+		if d := c.Drift.DelayMS; d != 0 && !tools.LocalAvmux {
 			a = append(a, "--chapter-sync", strconv.Itoa(d))
 		}
 	} else {

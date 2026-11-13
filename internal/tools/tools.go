@@ -122,7 +122,7 @@ func Hint(name string) string { return installHint(name) }
 
 // Required is the full set of external tools RedSync can use.
 func Required() []string {
-	return []string{FFmpeg, FFprobe, MkvMerge, MkvExtr, MkvProp, Mediainf, DoviTool, Hdr10Plus}
+	return append([]string{FFmpeg, FFprobe, MkvMerge, MkvExtr, MkvProp, Mediainf, DoviTool, Hdr10Plus}, localTools()...)
 }
 
 // Bundled reports whether a tool ships inside the binary.

@@ -13,3 +13,6 @@
 # local media fixtures and generated sync deliverables (may be copyrighted)
 /Test/
 .grepai/
+
+# local-only build overrides (avmux muxer); never used for releases
+/local.mk

@@ -27,7 +27,7 @@ type mkvIdentify struct {
 // number video/audio/subtitle tracks in file order starting at 0, the same
 // scheme ffprobe uses for stream index, so the two line up directly.
 func enrichLangIETF(_ context.Context, path string) map[int]string {
-	cmd, err := tools.Cmd(tools.MkvMerge, "-J", path)
+	cmd, err := tools.Cmd(tools.Muxer, "-J", path)
 	if err != nil {
 		return nil
 	}

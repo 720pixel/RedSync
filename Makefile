@@ -4,8 +4,13 @@ GOFLAGS := -mod=mod
 
 .PHONY: build linux windows clean run
 
+# Optional gitignored local.mk can set TAGS for local builds only (e.g. TAGS=avmux
+# to mux with avmux instead of mkvmerge). The linux/windows/release targets never
+# read TAGS: public binaries always mux with MKVToolNix.
+-include local.mk
+
 build:
-	GOFLAGS=$(GOFLAGS) go build -ldflags "$(LDFLAGS)" -o RedSync .
+	GOFLAGS=$(GOFLAGS) go build -tags '$(TAGS)' -ldflags "$(LDFLAGS)" -o RedSync .
 
 # cross builds. cgo stays off so these are static and need no system libs.
 linux:
